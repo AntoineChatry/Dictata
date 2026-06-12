@@ -5,9 +5,6 @@ global hotkey, speak, press again: the text is transcribed locally by
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and pasted into the
 active application. No data ever leaves the machine.
 
-Native port of the Python version (`freewhisper`), with feature parity:
-a single executable, no Python environment, GPU transcription via Vulkan.
-
 ## Features
 
 - **Hotkey dictation** (toggle or push-to-talk), automatic paste into the
