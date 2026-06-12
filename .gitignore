@@ -1,0 +1,10 @@
+/target
+# Machine-specific: short target-dir to work around Windows MAX_PATH (see README)
+.cargo/config.toml
+/fwhome
+/docs
+/models
+*.png
+config.json
+history.jsonl
+.claude/
