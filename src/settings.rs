@@ -117,6 +117,18 @@ pub struct SettingsState {
     pub position_dock_request: bool,
     /// Audio/video file transcription in progress (History page).
     filetx: Option<FileTx>,
+    /// HuggingFace search (Models page).
+    hf_query: String,
+    hf_repos: Vec<String>,
+    hf_files: Vec<models::HfFile>,
+    hf_error: Option<String>,
+    hf_task: Option<Arc<Mutex<Option<HfOutcome>>>>,
+}
+
+/// Result of a HuggingFace fetch (search or repo file listing).
+enum HfOutcome {
+    Repos(Result<Vec<String>, String>),
+    Files(Result<Vec<models::HfFile>, String>),
 }
 
 /// "Transcribe a file" worker: the result arrives via `done`.
@@ -127,7 +139,7 @@ struct FileTx {
 impl SettingsState {
     pub fn new(cfg: Config) -> Self {
         let hw = hardware::detect();
-        let reco = hardware::recommended(&hw).to_string();
+        let reco = hardware::recommended(&hw, hardware::gpu_active(&hw, &cfg.gpu)).to_string();
         let mics = audio::list_input_devices();
         let selected_mode = if cfg.modes.contains_key(&cfg.active_mode) {
             cfg.active_mode.clone()
@@ -159,6 +171,11 @@ impl SettingsState {
             status: String::new(),
             position_dock_request: false,
             filetx: None,
+            hf_query: String::new(),
+            hf_repos: Vec::new(),
+            hf_files: Vec::new(),
+            hf_error: None,
+            hf_task: None,
         }
     }
 
@@ -965,7 +982,10 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         });
         if done {
             st.download = None;
-            let msg = tr("models_installed_ok").to_string();
+            let msg = match &err {
+                Some(e) => format!("{} {e}", tr("models_dl_error")),
+                None => tr("models_installed_ok").to_string(),
+            };
             st.set_status(&msg);
         } else {
             ctx.request_repaint();
@@ -1032,7 +1052,7 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         for c in models::CATALOG {
             let active = st.cfg.model == c.name;
             let inst = models::is_installed(&dir, c.name);
-            let rating = hardware::rate(c.name, &st.hw);
+            let rating = hardware::rate(c.name, &st.hw, hardware::gpu_active(&st.hw, &st.cfg.gpu));
             let badge = if !rating.label.is_empty() {
                 Some((rating.label.clone(), rating_color(rating.level)))
             } else {
@@ -1041,6 +1061,104 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
             let _ = &reco;
             let sub = format!("{} Mo \u{00b7} {}", c.size_mb, rating.detail);
             model_row(ui, st, c.name, c.label, &sub, active, inst, badge);
+        }
+    });
+
+    // HuggingFace search.
+    if let Some(task) = &st.hf_task {
+        let outcome = task.lock().unwrap().take();
+        if let Some(outcome) = outcome {
+            st.hf_task = None;
+            st.hf_error = None;
+            match outcome {
+                HfOutcome::Repos(Ok(r)) => {
+                    st.hf_files.clear();
+                    st.hf_repos = r;
+                }
+                HfOutcome::Files(Ok(f)) => {
+                    st.hf_repos.clear();
+                    st.hf_files = f;
+                }
+                HfOutcome::Repos(Err(e)) | HfOutcome::Files(Err(e)) => st.hf_error = Some(e),
+            }
+        }
+    }
+    card(ui, Some(tr("hf_card")), |ui| {
+        ui.label(RichText::new(tr("hf_hint")).color(DIM).size(12.0));
+        ui.add_space(4.0);
+        let mut go = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::TextEdit::singleline(&mut st.hf_query).desired_width(320.0));
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
+            if ui.button(tr("hf_search")).clicked() {
+                go = true;
+            }
+            if st.hf_task.is_some() {
+                ui.label(RichText::new(tr("hf_searching")).color(DIM));
+            }
+        });
+        if go && !st.hf_query.trim().is_empty() && st.hf_task.is_none() {
+            st.hf_error = None;
+            match models::parse_hf_query(&st.hf_query) {
+                models::HfQuery::FileUrl(url, fname) => {
+                    if st.download.is_none() {
+                        st.download = Some(spawn_download_url(&dir, &url, &fname, &fname, ui.ctx().clone()));
+                    }
+                }
+                q => st.hf_task = Some(spawn_hf(q, ui.ctx().clone())),
+            }
+        }
+        if let Some(e) = &st.hf_error {
+            ui.colored_label(BAD, e);
+        }
+        // Search results: repos to browse.
+        if !st.hf_repos.is_empty() {
+            ui.add_space(4.0);
+            let repos = st.hf_repos.clone();
+            for repo in &repos {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(repo).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if st.hf_task.is_none() && ui.button(tr("hf_browse")).clicked() {
+                            st.hf_task =
+                                Some(spawn_hf(models::HfQuery::Repo(repo.clone()), ui.ctx().clone()));
+                        }
+                    });
+                });
+            }
+        }
+        // Repo files: downloadable .bin.
+        if !st.hf_files.is_empty() {
+            ui.add_space(4.0);
+            let files = st.hf_files.clone();
+            ui.label(RichText::new(&files[0].repo).color(DIM).size(12.0));
+            for f in &files {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&f.fname).strong());
+                    if let Some(s) = f.size {
+                        ui.label(RichText::new(format!("{} Mo", s / 1_000_000)).color(DIM).size(11.0));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if models::is_installed(&dir, &f.fname) {
+                            ui.label(RichText::new(tr("models_done")).color(OK));
+                        } else if st.download.is_none() {
+                            if ui.button(tr("models_download")).clicked() {
+                                st.download = Some(spawn_download_url(
+                                    &dir,
+                                    &f.url(),
+                                    &f.fname,
+                                    &f.fname,
+                                    ui.ctx().clone(),
+                                ));
+                            }
+                        } else {
+                            ui.add_enabled(false, egui::Button::new(tr("models_download")));
+                        }
+                    });
+                });
+            }
         }
     });
 }
@@ -1089,6 +1207,13 @@ fn model_row(
                     if active {
                         ui.label(RichText::new(tr("models_active")).color(ACCENT).strong());
                     } else if installed {
+                        if ui.button(tr("models_delete")).clicked() {
+                            let msg = match models::delete(&st.cfg.model_dir, model_name) {
+                                Ok(()) => tr("models_deleted").to_string(),
+                                Err(e) => format!("{} {e}", tr("models_del_error")),
+                            };
+                            st.set_status(&msg);
+                        }
                         let b = egui::Button::new(RichText::new(tr("models_use")).color(DARK_ON_ACCENT).strong())
                             .fill(ACCENT)
                             .corner_radius(5.0);
@@ -1227,15 +1352,22 @@ fn spawn_filetx(cfg: &Config, path: std::path::PathBuf, ctx: egui::Context) -> F
 
 // ---------- download ----------
 fn spawn_download(dir: &str, model: &str, ctx: egui::Context) -> Download {
+    let fname = models::file_name(model);
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{fname}");
+    spawn_download_url(dir, &url, &fname, model, ctx)
+}
+
+/// Downloads an arbitrary URL (HuggingFace search) on a worker thread.
+fn spawn_download_url(dir: &str, url: &str, fname: &str, label: &str, ctx: egui::Context) -> Download {
     let received = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
     let finished = Arc::new(AtomicBool::new(false));
     let error = Arc::new(Mutex::new(None));
-    let (d, m) = (dir.to_string(), model.to_string());
+    let (d, u, f) = (dir.to_string(), url.to_string(), fname.to_string());
     let (r2, t2, f2, e2) = (received.clone(), total.clone(), finished.clone(), error.clone());
     std::thread::spawn(move || {
         let r3 = r2.clone();
-        let res = models::download(&d, &m, |recu, tot| {
+        let res = models::download_url(&d, &u, &f, |recu, tot| {
             r3.store(recu, Ordering::Relaxed);
             if let Some(t) = tot {
                 t2.store(t, Ordering::Relaxed);
@@ -1249,10 +1381,26 @@ fn spawn_download(dir: &str, model: &str, ctx: egui::Context) -> Download {
         ctx.request_repaint();
     });
     Download {
-        model: model.to_string(),
+        model: label.to_string(),
         received,
         total,
         finished,
         error,
     }
+}
+
+/// Runs a HuggingFace fetch (search or file listing) on a worker thread.
+fn spawn_hf(query: models::HfQuery, ctx: egui::Context) -> Arc<Mutex<Option<HfOutcome>>> {
+    let slot: Arc<Mutex<Option<HfOutcome>>> = Arc::new(Mutex::new(None));
+    let slot2 = slot.clone();
+    std::thread::spawn(move || {
+        let outcome = match query {
+            models::HfQuery::Search(q) => HfOutcome::Repos(models::hf_search(&q)),
+            models::HfQuery::Repo(r) => HfOutcome::Files(models::hf_list_files(&r)),
+            models::HfQuery::FileUrl(..) => unreachable!("handled by the caller"),
+        };
+        *slot2.lock().unwrap() = Some(outcome);
+        ctx.request_repaint();
+    });
+    slot
 }

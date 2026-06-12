@@ -9,15 +9,17 @@ fn main() {
     println!("Coeurs    : {} physiques / {} logiques", info.cpu_physical, info.cpu_logical);
     println!("RAM       : {:?} Go (dispo {:?})", info.ram_total_gb, info.ram_avail_gb);
     println!("Resume    : {}", hardware::summary(&info));
-    println!("Recommande: {}", hardware::recommended(&info));
+    println!("GPU       : {:?} ({:?} Go)", info.gpu_name, info.vram_gb);
+    let gpu = hardware::gpu_active(&info, "auto");
+    println!("Recommande: {} (gpu_active={gpu})", hardware::recommended(&info, gpu));
     println!();
 
     println!("Catalogue (note pour cette machine) :");
     for c in models::CATALOG {
-        let r = hardware::rate(c.name, &info);
+        let r = hardware::rate(c.name, &info, gpu);
         println!(
-            "  {:24} {:>5} Mo  [{:?}] {}",
-            c.name, c.size_mb, r.level, r.label
+            "  {:24} {:>5} Mo  [{:?}] {} \u{2014} {}",
+            c.name, c.size_mb, r.level, r.label, r.detail
         );
     }
 

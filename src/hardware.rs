@@ -1,7 +1,7 @@
 //! Hardware detection + model recommendation, LM Studio style.
 //!
-//! The default binary runs whisper.cpp on **CPU** (no GPU backend
-//! compiled): the recommendation is therefore based on RAM and core count.
+//! With the `vulkan` feature (default) and `gpu != "cpu"`, ratings are based
+//! on the detected GPU VRAM; otherwise on RAM and core count (CPU mode).
 //! Memory footprints are conservative estimates (quantized ggml).
 
 /// Approximate memory footprint (GB) + CPU speed tier per size.
@@ -49,6 +49,9 @@ pub struct HwInfo {
     pub cpu_physical: usize,
     pub cpu_logical: usize,
     pub cpu_name: String,
+    /// Most capable GPU detected (highest VRAM), if any.
+    pub gpu_name: Option<String>,
+    pub vram_gb: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,16 +139,73 @@ fn cpu_name() -> String {
     "CPU".to_string()
 }
 
+/// (name, VRAM GB) of the GPU with the most VRAM, via the display-class
+/// registry key (same reg.exe approach as `cpu_name`).
+#[cfg(windows)]
+fn gpu_info() -> Option<(String, f32)> {
+    const KEY: &str =
+        r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    // Lines of `reg query /s /v <value>`: subkey path, then the value line.
+    let query = |value: &str| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Ok(o) = std::process::Command::new("reg")
+            .args(["query", KEY, "/s", "/v", value])
+            .output()
+        {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut cur = String::new();
+            for line in s.lines() {
+                if line.starts_with("HKEY_") {
+                    cur = line.trim().to_string();
+                } else if let Some(pos) = line.find("REG_") {
+                    if let Some(data) = line[pos..].split_once(char::is_whitespace) {
+                        out.push((cur.clone(), data.1.trim().to_string()));
+                    }
+                }
+            }
+        }
+        out
+    };
+    let names: std::collections::HashMap<String, String> =
+        query("DriverDesc").into_iter().collect();
+    let mut best: Option<(String, f32)> = None;
+    for (key, hex) in query("HardwareInformation.qwMemorySize") {
+        let bytes = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+        let gb = (bytes as f64 / 1024f64.powi(3) * 10.0).round() as f32 / 10.0;
+        if gb > 0.0 && best.as_ref().is_none_or(|(_, b)| gb > *b) {
+            if let Some(name) = names.get(&key) {
+                best = Some((name.clone(), gb));
+            }
+        }
+    }
+    best
+}
+
+#[cfg(not(windows))]
+fn gpu_info() -> Option<(String, f32)> {
+    // No portable VRAM detection without an extra dependency: CPU ratings.
+    None
+}
+
 pub fn detect() -> HwInfo {
     let ram = ram_bytes();
     let to_gb = |b: u64| (b as f64 / 1024f64.powi(3) * 10.0).round() as f32 / 10.0;
+    let gpu = gpu_info();
     HwInfo {
         ram_total_gb: ram.map(|(t, _)| to_gb(t)),
         ram_avail_gb: ram.map(|(_, a)| to_gb(a)),
         cpu_physical: num_cpus::get_physical(),
         cpu_logical: num_cpus::get(),
         cpu_name: cpu_name(),
+        gpu_name: gpu.as_ref().map(|(n, _)| n.clone()),
+        vram_gb: gpu.map(|(_, v)| v),
     }
+}
+
+/// True when transcription will actually run on the GPU: Vulkan compiled in,
+/// config not forcing CPU, and a GPU detected.
+pub fn gpu_active(info: &HwInfo, gpu_cfg: &str) -> bool {
+    cfg!(feature = "vulkan") && gpu_cfg != "cpu" && info.gpu_name.is_some()
 }
 
 /// Guess the size (`model_info` key) from a name or repo.
@@ -169,7 +229,17 @@ pub fn size_key(name_or_id: &str) -> Option<&'static str> {
 }
 
 /// Ideal model for this machine (the "star" LM Studio style).
-pub fn recommended(info: &HwInfo) -> &'static str {
+pub fn recommended(info: &HwInfo, use_gpu: bool) -> &'static str {
+    if use_gpu {
+        if let Some(vram) = info.vram_gb {
+            if vram >= 6.0 {
+                return "large-v3-turbo";
+            }
+            if vram >= 3.0 {
+                return "small";
+            }
+        }
+    }
     let ram = info.ram_total_gb.unwrap_or(4.0);
     let cores = if info.cpu_physical > 0 {
         info.cpu_physical
@@ -187,8 +257,9 @@ pub fn recommended(info: &HwInfo) -> &'static str {
     }
 }
 
-/// Rate a model for the machine.
-pub fn rate(name_or_id: &str, info: &HwInfo) -> Rating {
+/// Rate a model for the machine. `use_gpu` = transcription runs on the GPU
+/// (see `gpu_active`): ratings are then based on VRAM, not CPU speed.
+pub fn rate(name_or_id: &str, info: &HwInfo, use_gpu: bool) -> Rating {
     let key = match size_key(name_or_id) {
         Some(k) => k,
         None => {
@@ -201,10 +272,45 @@ pub fn rate(name_or_id: &str, info: &HwInfo) -> Rating {
         }
     };
     let spec = model_info(key).expect("cle connue");
-    let reco = recommended(info);
+
+    // GPU: VRAM is the constraint; anything that fits runs fast.
+    if use_gpu {
+        if let Some(vram) = info.vram_gb {
+            let gpu = info.gpu_name.as_deref().unwrap_or("GPU");
+            if spec.ram_gb <= (vram - 0.5).max(0.0) {
+                let is_reco = size_key(recommended(info, true)) == Some(key);
+                return if is_reco {
+                    Rating {
+                        level: Level::Ideal,
+                        label: "\u{2605} Ideal pour ta machine".into(),
+                        detail: format!("rapide sur {gpu}"),
+                        color: "#5eaaff",
+                    }
+                } else {
+                    Rating {
+                        level: Level::Good,
+                        label: "Recommande".into(),
+                        detail: format!("rapide sur {gpu}"),
+                        color: "#5ad28c",
+                    }
+                };
+            }
+            // Does not fit in VRAM: rated as CPU, annotated.
+            let mut r = rate_cpu(key, &spec, info);
+            if r.level != Level::TooBig {
+                r.detail = format!("{} \u{2014} VRAM insuffisante ({vram:.0} Go)", r.detail);
+            }
+            return r;
+        }
+    }
+    rate_cpu(key, &spec, info)
+}
+
+/// CPU rating: RAM is a hard constraint, speed a soft constraint.
+fn rate_cpu(key: &'static str, spec: &ModelInfo, info: &HwInfo) -> Rating {
+    let reco = recommended(info, false);
     let is_reco = size_key(reco) == Some(key);
 
-    // CPU: RAM is a hard constraint, speed a soft constraint.
     if let Some(ram_total) = info.ram_total_gb {
         if spec.ram_gb > (ram_total - 1.0).max(0.0) {
             return Rating {
@@ -254,7 +360,11 @@ pub fn summary(info: &HwInfo) -> String {
     if cores > 0 {
         parts.push(format!("{cores} coeurs"));
     }
-    parts.push("CPU".to_string());
+    match (&info.gpu_name, info.vram_gb) {
+        (Some(g), Some(v)) => parts.push(format!("{g} ({v:.0} Go)")),
+        (Some(g), None) => parts.push(g.clone()),
+        _ => parts.push("CPU".to_string()),
+    }
     parts.join(" \u{00b7} ")
 }
 
@@ -269,7 +379,15 @@ mod tests {
             cpu_physical: cores,
             cpu_logical: cores,
             cpu_name: "test".into(),
+            gpu_name: None,
+            vram_gb: None,
         }
+    }
+
+    fn with_gpu(mut m: HwInfo, name: &str, vram: f32) -> HwInfo {
+        m.gpu_name = Some(name.into());
+        m.vram_gb = Some(vram);
+        m
     }
 
     #[test]
@@ -282,19 +400,41 @@ mod tests {
 
     #[test]
     fn reco_tiers() {
-        assert_eq!(recommended(&machine(2.0, 4)), "tiny"); // low RAM
-        assert_eq!(recommended(&machine(8.0, 4)), "base");
-        assert_eq!(recommended(&machine(16.0, 12)), "small");
-        assert_eq!(recommended(&machine(4.0, 2)), "tiny"); // 2 cores
+        assert_eq!(recommended(&machine(2.0, 4), false), "tiny"); // low RAM
+        assert_eq!(recommended(&machine(8.0, 4), false), "base");
+        assert_eq!(recommended(&machine(16.0, 12), false), "small");
+        assert_eq!(recommended(&machine(4.0, 2), false), "tiny"); // 2 cores
+        // GPU: VRAM drives the tiers.
+        let g12 = with_gpu(machine(16.0, 8), "RX 7700 XT", 12.0);
+        assert_eq!(recommended(&g12, true), "large-v3-turbo");
+        assert_eq!(recommended(&g12, false), "small"); // forced CPU
+        let g4 = with_gpu(machine(8.0, 4), "GTX 970", 4.0);
+        assert_eq!(recommended(&g4, true), "small");
     }
 
     #[test]
     fn rate_too_big_and_ideal() {
         let m8 = machine(8.0, 4); // reco = base
-        assert_eq!(rate("base", &m8).level, Level::Ideal);
+        assert_eq!(rate("base", &m8, false).level, Level::Ideal);
         let m4 = machine(4.0, 4); // reco = tiny
-        assert_eq!(rate("tiny", &m4).level, Level::Ideal);
-        assert_eq!(rate("large-v3", &m4).level, Level::TooBig); // 5 GB > 3 GB available
-        assert_eq!(rate("inconnu", &m4).level, Level::Unknown);
+        assert_eq!(rate("tiny", &m4, false).level, Level::Ideal);
+        assert_eq!(rate("large-v3", &m4, false).level, Level::TooBig); // 5 GB > 3 GB available
+        assert_eq!(rate("inconnu", &m4, false).level, Level::Unknown);
+    }
+
+    #[test]
+    fn rate_gpu() {
+        let g12 = with_gpu(machine(16.0, 8), "RX 7700 XT", 12.0);
+        let r = rate("large-v3-turbo", &g12, true);
+        assert_eq!(r.level, Level::Ideal);
+        assert!(r.detail.contains("RX 7700 XT"), "{}", r.detail);
+        assert_eq!(rate("medium", &g12, true).level, Level::Good);
+        // Model bigger than VRAM: falls back to the CPU rating, annotated.
+        let g2 = with_gpu(machine(16.0, 8), "petit GPU", 2.0);
+        let r = rate("large-v3", &g2, true);
+        assert_ne!(r.level, Level::Ideal);
+        assert!(r.detail.contains("VRAM insuffisante"), "{}", r.detail);
+        // No GPU detected: same as CPU even with use_gpu.
+        assert_eq!(rate("base", &machine(8.0, 4), true).level, Level::Ideal);
     }
 }

@@ -33,7 +33,13 @@ pub const CATALOG: &[CatalogEntry] = &[
 ];
 
 pub fn file_name(model: &str) -> String {
-    format!("ggml-{model}.bin")
+    // Custom models (HuggingFace search) are stored under their full file
+    // name; catalog names keep the `ggml-{name}.bin` scheme.
+    if model.ends_with(".bin") {
+        model.to_string()
+    } else {
+        format!("ggml-{model}.bin")
+    }
 }
 
 pub fn model_path(model_dir: &str, model: &str) -> PathBuf {
@@ -44,6 +50,11 @@ pub fn is_installed(model_dir: &str, model: &str) -> bool {
     model_path(model_dir, model).exists()
 }
 
+/// Delete an installed model file.
+pub fn delete(model_dir: &str, model: &str) -> Result<(), String> {
+    std::fs::remove_file(model_path(model_dir, model)).map_err(|e| e.to_string())
+}
+
 /// List the ggml models present in `model_dir` (names without `ggml-`/`.bin`).
 pub fn list_installed(model_dir: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -52,6 +63,9 @@ pub fn list_installed(model_dir: &str) -> Vec<String> {
             if let Some(n) = e.file_name().to_str() {
                 if let Some(s) = n.strip_prefix("ggml-").and_then(|s| s.strip_suffix(".bin")) {
                     out.push(s.to_string());
+                } else if n.ends_with(".bin") {
+                    // Custom model: identified by its full file name.
+                    out.push(n.to_string());
                 }
             }
         }
@@ -65,17 +79,28 @@ pub fn list_installed(model_dir: &str) -> Vec<String> {
 pub fn download(
     model_dir: &str,
     model: &str,
-    mut progress: impl FnMut(u64, Option<u64>),
+    progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
     let fname = file_name(model);
     let url = format!("{HF_BASE}/{fname}");
+    download_url(model_dir, &url, &fname, progress)
+}
+
+/// Download an arbitrary URL into `model_dir` under `fname` (same `.part`
+/// then rename scheme as `download`).
+pub fn download_url(
+    model_dir: &str,
+    url: &str,
+    fname: &str,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(model_dir).map_err(|e| format!("dossier modeles: {e}"))?;
-    let dest = Path::new(model_dir).join(&fname);
+    let dest = Path::new(model_dir).join(fname);
     let tmp = dest.with_extension("part");
 
     // Default blocking client: no timeout (large downloads).
     let mut resp = reqwest::blocking::Client::new()
-        .get(&url)
+        .get(url)
         .send()
         .map_err(|e| format!("requete: {e}"))?;
     if !resp.status().is_success() {
@@ -100,6 +125,122 @@ pub fn download(
     Ok(dest)
 }
 
+// ---------- HuggingFace browsing ----------
+
+/// `.bin` file of a HuggingFace repo (candidate ggml model).
+#[derive(Clone)]
+pub struct HfFile {
+    pub repo: String,
+    pub fname: String,
+    pub size: Option<u64>,
+}
+
+impl HfFile {
+    pub fn url(&self) -> String {
+        format!("https://huggingface.co/{}/resolve/main/{}", self.repo, self.fname)
+    }
+}
+
+fn hf_get(url: &str) -> Result<serde_json::Value, String> {
+    let resp = reqwest::blocking::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .map_err(|e| format!("requete: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json().map_err(|e| format!("json: {e}"))
+}
+
+/// Search repos on HuggingFace; returns repo ids ("owner/name").
+pub fn hf_search(query: &str) -> Result<Vec<String>, String> {
+    let url = format!(
+        "https://huggingface.co/api/models?search={}&limit=20",
+        urlencode(query)
+    );
+    let v = hf_get(&url)?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// List the `.bin` files of a HuggingFace repo.
+pub fn hf_list_files(repo: &str) -> Result<Vec<HfFile>, String> {
+    let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
+    let v = hf_get(&url)?;
+    let mut out = Vec::new();
+    if let Some(sib) = v.get("siblings").and_then(|s| s.as_array()) {
+        for f in sib {
+            if let Some(name) = f.get("rfilename").and_then(|n| n.as_str()) {
+                if name.ends_with(".bin") && !name.contains('/') {
+                    out.push(HfFile {
+                        repo: repo.to_string(),
+                        fname: name.to_string(),
+                        size: f.get("size").and_then(|s| s.as_u64()),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Interprets the search-field input: direct file URL, repo URL, repo id
+/// ("owner/name") or free-text query.
+pub enum HfQuery {
+    /// Direct downloadable file (url, file name).
+    FileUrl(String, String),
+    /// Repo whose files should be listed.
+    Repo(String),
+    /// Free-text search.
+    Search(String),
+}
+
+pub fn parse_hf_query(input: &str) -> HfQuery {
+    let s = input.trim().trim_end_matches('/');
+    if let Some(rest) = s
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| s.strip_prefix("http://huggingface.co/"))
+    {
+        // File URL: https://huggingface.co/owner/name/resolve/main/file.bin
+        if rest.contains("/resolve/") || rest.contains("/blob/") {
+            let fname = rest.rsplit('/').next().unwrap_or("model.bin").to_string();
+            let url = s.replace("/blob/", "/resolve/");
+            return HfQuery::FileUrl(url, fname);
+        }
+        // Repo URL: https://huggingface.co/owner/name[/tree/...]
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 2 {
+            return HfQuery::Repo(format!("{}/{}", parts[0], parts[1]));
+        }
+        return HfQuery::Search(rest.to_string());
+    }
+    // Bare repo id: exactly one '/', no spaces.
+    if s.matches('/').count() == 1 && !s.contains(' ') && !s.starts_with("http") {
+        return HfQuery::Repo(s.to_string());
+    }
+    HfQuery::Search(s.to_string())
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +249,35 @@ mod tests {
     fn file_name_scheme() {
         assert_eq!(file_name("base"), "ggml-base.bin");
         assert_eq!(file_name("small-q5_1"), "ggml-small-q5_1.bin");
+        // Custom models keep their full file name.
+        assert_eq!(file_name("whisper-large-zh.bin"), "whisper-large-zh.bin");
+    }
+
+    #[test]
+    fn hf_query_parsing() {
+        match parse_hf_query("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin") {
+            HfQuery::FileUrl(url, fname) => {
+                assert_eq!(fname, "ggml-base.bin");
+                assert!(url.contains("/resolve/main/"));
+            }
+            _ => panic!("expected FileUrl"),
+        }
+        match parse_hf_query("https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-base.bin") {
+            HfQuery::FileUrl(url, _) => assert!(url.contains("/resolve/")),
+            _ => panic!("expected FileUrl"),
+        }
+        match parse_hf_query("https://huggingface.co/ggerganov/whisper.cpp") {
+            HfQuery::Repo(r) => assert_eq!(r, "ggerganov/whisper.cpp"),
+            _ => panic!("expected Repo"),
+        }
+        match parse_hf_query("ggerganov/whisper.cpp") {
+            HfQuery::Repo(r) => assert_eq!(r, "ggerganov/whisper.cpp"),
+            _ => panic!("expected Repo"),
+        }
+        match parse_hf_query("whisper ggml") {
+            HfQuery::Search(q) => assert_eq!(q, "whisper ggml"),
+            _ => panic!("expected Search"),
+        }
     }
 
     #[test]

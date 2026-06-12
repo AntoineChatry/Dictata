@@ -21,7 +21,11 @@ active application. No data ever leaves the machine.
 - **Transcribe a file** (audio/video, History page) — any format handled by
   ffmpeg.
 - Custom **vocabulary and replacements** injected as the initial prompt.
-- Built-in **ggml model library** (download, hardware-based recommendation).
+- Built-in **ggml model library**: download, delete, and hardware-aware
+  recommendations (detected GPU/VRAM when running on Vulkan, CPU/RAM
+  otherwise).
+- **HuggingFace search**: install any ggml `.bin` model from a direct URL, a
+  repo (`owner/name`) or a keyword search.
 - **fr / en / es interface**, dark theme, system tray icon, transcription
   history.
 
@@ -92,7 +96,7 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 | `settings_logic.rs` | Settings business logic, testable without UI |
 | `dock.rs` | Floating dock (waveform, states) |
 | `modes.rs` / `llm.rs` | Output modes and local LLM post-processing |
-| `models.rs` | ggml catalog, download, paths |
+| `models.rs` | ggml catalog, download/delete, HuggingFace search, paths |
 | `i18n.rs` | fr/en/es translations (`tr()`) |
 | `config.rs` / `history.rs` / `paste.rs` / `hotkey.rs` / `tray.rs` / `hardware.rs` / `platform.rs` | Config, history, paste, global hotkey, tray, hardware detection, Windows integration |
 
@@ -102,7 +106,8 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 cargo test
 ```
 
-21 unit tests (config, resampling, mixing, modes, settings logic…). A CLI
+23 unit tests (config, resampling, mixing, modes, settings logic, hardware
+rating, HuggingFace query parsing…). A CLI
 example is provided:
 
 ```powershell

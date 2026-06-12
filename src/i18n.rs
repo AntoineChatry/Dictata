@@ -168,6 +168,23 @@ static STRINGS: &[(&str, &str, &str, &str)] = &[
     ("models_downloading", "Téléchargement :", "Downloading:", "Descargando:"),
     ("models_done", "Terminé", "Done", "Hecho"),
     ("models_installed_ok", "Modèle installé", "Model installed", "Modelo instalado"),
+    ("models_dl_error", "Échec du téléchargement :", "Download failed:", "Error de descarga:"),
+    ("models_delete", "Supprimer", "Delete", "Eliminar"),
+    ("models_deleted", "Modèle supprimé", "Model deleted", "Modelo eliminado"),
+    ("models_del_error", "Échec de la suppression :", "Delete failed:", "Error al eliminar:"),
+    // --- HuggingFace search ---
+    ("hf_card", "Recherche HuggingFace", "HuggingFace search", "Búsqueda HuggingFace"),
+    (
+        "hf_hint",
+        "URL directe, dépôt (auteur/nom) ou mot-clé. Fichiers ggml .bin uniquement.",
+        "Direct URL, repo (owner/name) or keyword. ggml .bin files only.",
+        "URL directa, repositorio (autor/nombre) o palabra clave. Solo archivos ggml .bin.",
+    ),
+    ("hf_search", "Rechercher", "Search", "Buscar"),
+    ("hf_searching", "Recherche…", "Searching…", "Buscando…"),
+    ("hf_no_results", "Aucun résultat", "No results", "Sin resultados"),
+    ("hf_no_bin", "Aucun fichier .bin dans ce dépôt", "No .bin file in this repo", "Ningún archivo .bin en este repositorio"),
+    ("hf_browse", "Voir les fichiers", "Browse files", "Ver archivos"),
     // --- LLM ---
     ("llm_card", "Serveur local (OpenAI-compatible)", "Local server (OpenAI-compatible)", "Servidor local (compatible con OpenAI)"),
     ("llm_enable", "Activer le reformatage par LLM", "Enable LLM reformatting", "Activar el reformateo por LLM"),

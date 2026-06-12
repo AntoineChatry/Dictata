@@ -27,7 +27,7 @@ use dictata::{history, i18n, modes, paste, platform};
 
 /// Path of the ggml model file from the configured name (e.g. "tiny").
 fn model_file_path(cfg: &Config) -> PathBuf {
-    PathBuf::from(&cfg.model_dir).join(format!("ggml-{}.bin", cfg.model))
+    dictata::models::model_path(&cfg.model_dir, &cfg.model)
 }
 
 /// Result returned by the transcription thread.
@@ -59,6 +59,10 @@ struct App {
     no_activate_done: bool,
     dock_shown: bool,
     settings: Option<SettingsState>,
+    /// True once the settings viewport has been rendered at least once.
+    settings_live: bool,
+    /// Frames to wait before creating the settings viewport (see render_settings).
+    settings_warmup: u8,
     /// Streaming session in progress (continuous mode, raw type only).
     stream: Option<StreamingSession>,
     /// Worker of the last streaming session: joined before starting another.
@@ -109,6 +113,8 @@ impl App {
             no_activate_done: false,
             dock_shown: false,
             settings,
+            settings_live: false,
+            settings_warmup: 0,
             stream: None,
             stream_join: None,
         }
@@ -119,6 +125,24 @@ impl App {
     fn render_settings(&mut self, ctx: &egui::Context) {
         if self.settings.is_none() {
             return;
+        }
+        // eframe panics ("user callback was never called") if an immediate
+        // viewport is created while the parent window is actually hidden.
+        // Workaround: make the parent visible (it paints nothing and is fully
+        // transparent, so nothing shows on screen), wait one frame for the
+        // command to take effect, create the child, then hide the parent again.
+        if !self.settings_live {
+            if self.settings_warmup == 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                self.settings_warmup = 2;
+                ctx.request_repaint();
+                return;
+            }
+            self.settings_warmup -= 1;
+            if self.settings_warmup > 0 {
+                ctx.request_repaint();
+                return;
+            }
         }
         let mut closed_x = false;
         let mut result = settings::RenderResult::default();
@@ -140,6 +164,13 @@ impl App {
                 },
             );
         }
+        if !self.settings_live {
+            // Viewport created: the parent can go back to hidden.
+            self.settings_live = true;
+            if !self.dock_shown {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
         if result.save {
             let new_cfg = self.settings.as_ref().unwrap().cfg.clone();
             self.apply_config(new_cfg);
@@ -149,6 +180,8 @@ impl App {
         }
         if result.close || closed_x {
             self.settings = None;
+            self.settings_live = false;
+            self.settings_warmup = 0;
             // The window was tracking its working copy: revert to the real config.
             i18n::set_lang(&self.cfg.ui_lang);
         }
