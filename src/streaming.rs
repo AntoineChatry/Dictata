@@ -119,7 +119,7 @@ fn run(
     let mut buf: Vec<f32> = Vec::new();
     let mut text = String::new();
 
-    let mut flush = |buf: &mut Vec<f32>, text: &mut String| -> Result<(), String> {
+    let flush = |buf: &mut Vec<f32>, text: &mut String| -> Result<(), String> {
         let chunk = std::mem::take(buf);
         // Acquire the lock even if poisoned (another thread panicked):
         // an Option<Transcriber> stays coherent, at worst we reload it.
@@ -127,7 +127,7 @@ fn run(
         if guard.is_none() {
             *guard = Some(Transcriber::load(&params.model_path, params.gpu)?);
         }
-        let t = guard.as_ref().unwrap();
+        let t = guard.as_mut().unwrap();
         // Prompt = vocabulary + tail of the already-emitted text (continuity).
         let tail: String = {
             let chars: Vec<char> = text.chars().collect();
@@ -136,7 +136,7 @@ fn run(
         };
         let prompt = format!("{} {}", params.vocab_prompt, tail).trim().to_string();
         let prompt_opt = if prompt.is_empty() { None } else { Some(prompt.as_str()) };
-        let piece = t.transcribe(&chunk, params.language.as_deref(), false, prompt_opt, params.beam_size)?;
+        let piece = t.transcribe(&chunk, params.language.as_deref(), false, prompt_opt, params.beam_size, None)?;
         if !piece.is_empty() {
             let out = if text.is_empty() { piece } else { format!(" {piece}") };
             text.push_str(&out);

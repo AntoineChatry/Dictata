@@ -222,7 +222,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     };
     ctx.set_visuals(visuals);
     // Generous button/combo padding (SuperWhisper look).
-    ctx.style_mut(|s| s.spacing.button_padding = egui::vec2(12.0, 5.0));
+    ctx.global_style_mut(|s| s.spacing.button_padding = egui::vec2(12.0, 5.0));
 }
 
 // ---------- small widgets ----------
@@ -559,8 +559,8 @@ pub fn render(ui: &mut egui::Ui, st: &mut SettingsState) -> RenderResult {
     crate::i18n::set_lang(&st.cfg.ui_lang);
 
     // Sidebar (full height).
-    egui::SidePanel::left("nav")
-        .exact_width(210.0)
+    egui::Panel::left("nav")
+        .exact_size(210.0)
         .resizable(false)
         .frame(egui::Frame::NONE.fill(SIDEBAR).inner_margin(egui::Margin {
             left: 12, right: 8, top: 16, bottom: 12,
@@ -578,7 +578,7 @@ pub fn render(ui: &mut egui::Ui, st: &mut SettingsState) -> RenderResult {
         });
 
     // Footer (status + Close / Save), below the content.
-    egui::TopBottomPanel::bottom("footer")
+    egui::Panel::bottom("footer")
         .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin {
             left: 20, right: 20, top: 8, bottom: 12,
         }))
@@ -857,6 +857,10 @@ fn page_config(ui: &mut egui::Ui, st: &mut SettingsState) {
         ui.add_space(4.0);
         row(ui, tr("cfg_streaming"), tr("cfg_streaming_hint"), |ui| {
             toggle(ui, &mut st.cfg.streaming);
+        });
+        ui.add_space(4.0);
+        row(ui, tr("cfg_vad"), tr("cfg_vad_hint"), |ui| {
+            toggle(ui, &mut st.cfg.vad);
         });
         ui.add_space(4.0);
         row(ui, tr("cfg_ui_lang"), tr("cfg_ui_lang_hint"), |ui| {

@@ -75,11 +75,11 @@ pub fn transcribe_file(cfg: &Config, path: &Path) -> Result<String, String> {
         .or_else(|| cfg.modes.get("raw").cloned())
         .ok_or("aucun mode")?;
     let model_path = models::model_path(&cfg.model_dir, &cfg.model);
-    let t = Transcriber::load(&model_path, cfg.gpu != "cpu")?;
+    let mut t = Transcriber::load(&model_path, cfg.gpu != "cpu")?;
     let lang = mode.language.clone().or_else(|| cfg.language.clone());
     let prompt = modes::build_initial_prompt(&cfg.vocabulary, "");
     let prompt_opt = if prompt.is_empty() { None } else { Some(prompt.as_str()) };
-    let raw = t.transcribe(&audio_data, lang.as_deref(), mode.task == "translate", prompt_opt, cfg.beam_size)?;
+    let raw = t.transcribe(&audio_data, lang.as_deref(), mode.task == "translate", prompt_opt, cfg.beam_size, None)?;
     let (text, _status) = modes::apply_mode(&raw, &mode, cfg);
     if text.trim().is_empty() {
         return Err("transcription vide".into());

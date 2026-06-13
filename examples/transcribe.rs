@@ -54,14 +54,14 @@ fn main() {
     let t0 = Instant::now();
     let gpu = std::env::var("DICTATA_GPU").map(|v| v == "1").unwrap_or(false);
     println!("GPU: {gpu}");
-    let tr = Transcriber::load(&model, gpu).unwrap_or_else(|e| {
+    let mut tr = Transcriber::load(&model, gpu).unwrap_or_else(|e| {
         eprintln!("Chargement modele: {e}");
         std::process::exit(1);
     });
     println!("Modele charge en {:.2} s", t0.elapsed().as_secs_f32());
 
     let t1 = Instant::now();
-    let text = tr.transcribe(&audio, Some("en"), false, None, 5).unwrap_or_else(|e| {
+    let text = tr.transcribe(&audio, Some("en"), false, None, 5, None).unwrap_or_else(|e| {
         eprintln!("Transcription: {e}");
         std::process::exit(1);
     });

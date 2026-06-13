@@ -112,6 +112,13 @@ static STRINGS: &[(&str, &str, &str, &str)] = &[
         "Inserts text as you speak, at every pause. Raw mode only.",
         "Inserta el texto mientras hablas, en cada pausa. Solo modo Raw.",
     ),
+    ("cfg_vad", "Détection de voix (VAD)", "Voice detection (VAD)", "Detección de voz (VAD)"),
+    (
+        "cfg_vad_hint",
+        "Ignore les silences avant transcription (moins de calcul, moins d'hallucinations). Hors mode continu. Télécharge un petit modèle au 1er usage.",
+        "Skips silence before transcription (less compute, fewer hallucinations). Not in continuous mode. Downloads a small model on first use.",
+        "Omite los silencios antes de transcribir (menos cómputo, menos alucinaciones). No en modo continuo. Descarga un modelo pequeño la 1ª vez.",
+    ),
     ("cfg_ui_lang", "Langue de l'interface", "Interface language", "Idioma de la interfaz"),
     ("cfg_ui_lang_hint", "Change la langue de cette fenêtre.", "Changes the language of this window.", "Cambia el idioma de esta ventana."),
     ("cfg_dock_card", "Dock flottant", "Floating dock", "Dock flotante"),

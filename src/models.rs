@@ -86,6 +86,26 @@ pub fn download(
     download_url(model_dir, &url, &fname, progress)
 }
 
+// ---------- VAD model (whisper.cpp Silero) ----------
+
+/// File name of the VAD model (whisper.cpp Silero v5), stored next to the
+/// whisper models. Used by the one-shot path to skip silence before decoding.
+pub const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
+const VAD_MODEL_URL: &str =
+    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+
+pub fn vad_model_path(model_dir: &str) -> PathBuf {
+    Path::new(model_dir).join(VAD_MODEL_FILE)
+}
+
+/// Download the VAD model (~2 MB) into `model_dir` (`.part`-then-rename scheme).
+pub fn download_vad(
+    model_dir: &str,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, String> {
+    download_url(model_dir, VAD_MODEL_URL, VAD_MODEL_FILE, progress)
+}
+
 /// Download an arbitrary URL into `model_dir` under `fname` (same `.part`
 /// then rename scheme as `download`).
 pub fn download_url(

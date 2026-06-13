@@ -12,6 +12,10 @@ active application. No data ever leaves the machine.
   and position).
 - **Continuous mode (streaming)**: text is inserted as you speak, at every
   detected pause.
+- **Silence skipping (VAD)**: optional whisper.cpp voice-activity detection on
+  standard (non-streaming) dictation — less compute and fewer hallucinations on
+  silence. Downloads a small (~2 MB) model on first use; toggle in
+  Configuration.
 - **Vulkan GPU transcription** (AMD/Intel/NVIDIA) or CPU — whisper-rs with the
   `vulkan` feature.
 - **Audio sources**: microphone, system audio (WASAPI loopback) or a mix of
@@ -106,8 +110,8 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 cargo test
 ```
 
-23 unit tests (config, resampling, mixing, modes, settings logic, hardware
-rating, HuggingFace query parsing…). A CLI
+26 unit tests (config, resampling, mixing, modes, settings logic, hardware
+rating, HuggingFace query parsing, audio-context sizing…). A CLI
 example is provided:
 
 ```powershell
@@ -116,4 +120,13 @@ cargo run --example transcribe -- <file.wav>   # DICTATA_GPU=1 for GPU
 
 ## License
 
-Personal project — contact the author before reuse.
+Licensed under the **MIT License with the
+[Commons Clause](https://commonsclause.com/)** — see [LICENSE](LICENSE).
+
+- **Free** to use, copy, modify, distribute and self-host, for personal or any
+  other purpose.
+- **You may not _Sell_ it**: you cannot sell the software, or offer a paid
+  product or service (hosting, SaaS, paywall, paid support…) whose value
+  derives substantially from it.
+
+© 2026 Antoine Chatry.

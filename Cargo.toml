@@ -2,6 +2,7 @@
 name = "dictata"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
 
 [dependencies]
 arboard = "3"
@@ -23,6 +24,15 @@ whisper-rs = "0.16.0"
 # for a CPU-only binary that does not require the Vulkan SDK.
 default = ["vulkan"]
 vulkan = ["whisper-rs/vulkan"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"        # cross-crate inlining (whisper-rs, resampling): smaller, faster
+codegen-units = 1  # better optimisation at the cost of a slower build
+strip = true       # drop symbols: lighter shipped binary
+# NB: `panic = "abort"` is intentionally NOT set. streaming.rs relies on
+# std::panic::catch_unwind to keep the UI from hanging if the worker panics;
+# aborting on panic would defeat that safety net.
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"

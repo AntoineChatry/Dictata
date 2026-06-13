@@ -409,6 +409,18 @@ impl App {
                 ctx2.request_repaint();
                 return;
             }
+            // VAD (one-shot only): if the user enabled it, fetch the small
+            // model on first use, then hand its path to the transcription.
+            // Computed before locking so a download never blocks streaming.
+            let vad_path = if cfg.vad {
+                let p = dictata::models::vad_model_path(&cfg.model_dir);
+                if !p.exists() {
+                    let _ = dictata::models::download_vad(&cfg.model_dir, |_, _| {});
+                }
+                p.exists().then_some(p)
+            } else {
+                None
+            };
             let mut guard = tr.lock().unwrap_or_else(|p| p.into_inner());
             if guard.is_none() {
                 match Transcriber::load(&model_path, gpu) {
@@ -420,7 +432,7 @@ impl App {
                     }
                 }
             }
-            let t = guard.as_ref().unwrap();
+            let t = guard.as_mut().unwrap();
             let lang = mode.language.clone().or_else(|| cfg.language.clone());
             let translate = mode.task == "translate";
             let prompt = modes::build_initial_prompt(&cfg.vocabulary, "");
@@ -429,7 +441,7 @@ impl App {
             } else {
                 Some(prompt.as_str())
             };
-            match t.transcribe(&audio, lang.as_deref(), translate, prompt_opt, cfg.beam_size) {
+            match t.transcribe(&audio, lang.as_deref(), translate, prompt_opt, cfg.beam_size, vad_path.as_deref()) {
                 Ok(raw) => {
                     let (text, status) = modes::apply_mode(&raw, &mode, &cfg);
                     if !text.trim().is_empty() {
