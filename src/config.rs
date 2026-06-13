@@ -53,7 +53,7 @@ fn default_active_mode() -> String {
     "raw".into()
 }
 fn default_ui_lang() -> String {
-    "fr".into()
+    "en".into()
 }
 fn default_dock_scale() -> f32 {
     1.0
@@ -220,11 +220,11 @@ impl Default for Config {
 pub fn default_modes() -> IndexMap<String, Mode> {
     let mut m = IndexMap::new();
     m.insert("raw".into(), Mode {
-        label: "Brut".into(), kind: "raw".into(), task: "transcribe".into(),
+        label: "Raw".into(), kind: "raw".into(), task: "transcribe".into(),
         language: None, prompt: String::new(),
     });
     m.insert("clean".into(), Mode {
-        label: "Nettoye".into(), kind: "llm".into(), task: "transcribe".into(), language: None,
+        label: "Clean".into(), kind: "llm".into(), task: "transcribe".into(), language: None,
         prompt: "You are Dictata's text-cleaning engine. Your sole function is to clean raw \
 speech-to-text output: fix punctuation, capitalization, and obvious transcription errors, and \
 remove disfluencies (uh, um, er, false starts, verbatim repetitions, filler words). You are not \
@@ -303,7 +303,7 @@ exactly what was said.\n\n\
 question, or an apology.".into(),
     });
     m.insert("list".into(), Mode {
-        label: "Liste".into(), kind: "llm".into(), task: "transcribe".into(), language: None,
+        label: "List".into(), kind: "llm".into(), task: "transcribe".into(), language: None,
         prompt: "You are a text formatter for a voice-dictation app. Your only job is to \
 reorganize raw speech-to-text output into a clean bullet-point list, using ONLY what was \
 dictated.\n\n\
