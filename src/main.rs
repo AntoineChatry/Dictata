@@ -79,7 +79,8 @@ impl App {
                 None
             }
         };
-        let tray = match Tray::new() {
+        let mode_list = tray_mode_list(&cfg);
+        let tray = match Tray::new(&mode_list, &cfg.active_mode) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("tray: {e}");
@@ -221,6 +222,15 @@ impl App {
         }
         if let Some(m) = self.cfg.modes.get(&self.cfg.active_mode) {
             self.dock.mode_label = m.label.clone();
+        }
+        // Modes may have been renamed/added/removed in settings: rebuild the
+        // tray Mode submenu so it stays in sync.
+        let mode_list = tray_mode_list(&self.cfg);
+        let active = self.cfg.active_mode.clone();
+        if let Some(tray) = &mut self.tray {
+            if let Err(e) = tray.refresh(&mode_list, &active) {
+                eprintln!("tray refresh: {e}");
+            }
         }
         self.dock.scale = self.cfg.dock_scale.clamp(0.7, 1.6);
         self.dock.opacity = self.cfg.dock_opacity.clamp(0.4, 1.0);
@@ -527,18 +537,34 @@ impl eframe::App for App {
             }
         }
 
-        // Tray menu events.
-        if let Some(tray) = &self.tray {
-            for action in tray.poll_actions() {
-                match action {
-                    TrayAction::OpenSettings => {
-                        if self.settings.is_none() {
-                            self.settings = Some(SettingsState::new(self.cfg.clone()));
+        // Tray menu events. Drain first (owned Vec) so the loop body can
+        // mutate `self` freely.
+        let actions = self
+            .tray
+            .as_ref()
+            .map(|t| t.poll_actions())
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::SetMode(key) => {
+                    if key != self.cfg.active_mode {
+                        self.cfg.active_mode = key;
+                        config::save(&self.cfg);
+                        if let Some(m) = self.cfg.modes.get(&self.cfg.active_mode) {
+                            self.dock.mode_label = m.label.clone();
                         }
                     }
-                    TrayAction::Quit => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    if let Some(tray) = &self.tray {
+                        tray.set_active_mode(&self.cfg.active_mode);
                     }
+                }
+                TrayAction::OpenSettings => {
+                    if self.settings.is_none() {
+                        self.settings = Some(SettingsState::new(self.cfg.clone()));
+                    }
+                }
+                TrayAction::Quit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }
@@ -604,6 +630,14 @@ impl eframe::App for App {
         let delay = if active || self.settings.is_some() { 16 } else { 80 };
         ctx.request_repaint_after(Duration::from_millis(delay));
     }
+}
+
+/// (key, label) pairs for the tray Mode submenu, in config order.
+fn tray_mode_list(cfg: &Config) -> Vec<(String, String)> {
+    cfg.modes
+        .iter()
+        .map(|(k, m)| (k.clone(), m.label.clone()))
+        .collect()
 }
 
 fn main() -> eframe::Result {

@@ -225,6 +225,7 @@ static STRINGS: &[(&str, &str, &str, &str)] = &[
     ("status_mic_ko", "Micro KO", "Mic error", "Error de micro"),
     ("status_busy", "Transcription en cours…", "Still transcribing…", "Transcripción en curso…"),
     // --- Tray ---
+    ("tray_mode", "Mode", "Mode", "Modo"),
     ("tray_settings", "Réglages…", "Settings…", "Ajustes…"),
     ("tray_quit", "Quitter", "Quit", "Salir"),
     // --- transcription languages ---

@@ -4,33 +4,33 @@
 //! that creates it (eframe/winit in the app). Its events are drained via
 //! [`Tray::poll_actions`] from that same thread.
 
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::i18n::tr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
+    SetMode(String),
     OpenSettings,
     Quit,
 }
 
 pub struct Tray {
-    _tray: TrayIcon,
+    tray: TrayIcon,
     settings_id: MenuId,
     quit_id: MenuId,
+    // (mode key, checkable item) in display order; the item id maps back to the
+    // key in `poll_actions`, and `set_active_mode` toggles the check marks.
+    mode_items: Vec<(String, CheckMenuItem)>,
 }
 
 impl Tray {
-    pub fn new() -> Result<Self, String> {
-        let menu = Menu::new();
-        let settings = MenuItem::new(tr("tray_settings"), true, None);
-        let quit = MenuItem::new(tr("tray_quit"), true, None);
-        menu.append(&settings).map_err(|e| format!("menu: {e}"))?;
-        menu.append(&PredefinedMenuItem::separator())
-            .map_err(|e| format!("menu: {e}"))?;
-        menu.append(&quit).map_err(|e| format!("menu: {e}"))?;
-
+    /// `modes` = (key, label) pairs in display order; `active` = active mode key.
+    pub fn new(modes: &[(String, String)], active: &str) -> Result<Self, String> {
+        let (menu, settings_id, quit_id, mode_items) = build_menu(modes, active)?;
         let tray = TrayIconBuilder::new()
             .with_tooltip("Dictata")
             .with_icon(make_icon())
@@ -39,10 +39,29 @@ impl Tray {
             .map_err(|e| format!("tray: {e}"))?;
 
         Ok(Tray {
-            _tray: tray,
-            settings_id: settings.id().clone(),
-            quit_id: quit.id().clone(),
+            tray,
+            settings_id,
+            quit_id,
+            mode_items,
         })
+    }
+
+    /// Rebuilds the whole menu after the mode list changes (e.g. a mode is
+    /// renamed/added/removed in settings).
+    pub fn refresh(&mut self, modes: &[(String, String)], active: &str) -> Result<(), String> {
+        let (menu, settings_id, quit_id, mode_items) = build_menu(modes, active)?;
+        self.tray.set_menu(Some(Box::new(menu)));
+        self.settings_id = settings_id;
+        self.quit_id = quit_id;
+        self.mode_items = mode_items;
+        Ok(())
+    }
+
+    /// Updates the check marks so only `key` is ticked (exclusive selection).
+    pub fn set_active_mode(&self, key: &str) {
+        for (k, item) in &self.mode_items {
+            item.set_checked(k == key);
+        }
     }
 
     /// Drain menu events and return the corresponding actions.
@@ -54,10 +73,46 @@ impl Tray {
                 out.push(TrayAction::OpenSettings);
             } else if ev.id == self.quit_id {
                 out.push(TrayAction::Quit);
+            } else if let Some((k, _)) = self.mode_items.iter().find(|(_, it)| it.id() == &ev.id) {
+                out.push(TrayAction::SetMode(k.clone()));
             }
         }
         out
     }
+}
+
+/// Builds the context menu (Mode submenu above Settings) and returns it with
+/// the ids/items needed to route and update menu events.
+fn build_menu(
+    modes: &[(String, String)],
+    active: &str,
+) -> Result<(Menu, MenuId, MenuId, Vec<(String, CheckMenuItem)>), String> {
+    let menu = Menu::new();
+
+    let mode_menu = Submenu::new(tr("tray_mode"), true);
+    let mut mode_items = Vec::with_capacity(modes.len());
+    for (key, label) in modes {
+        let item = CheckMenuItem::new(label, true, key == active, None);
+        mode_menu.append(&item).map_err(|e| format!("menu: {e}"))?;
+        mode_items.push((key.clone(), item));
+    }
+    menu.append(&mode_menu).map_err(|e| format!("menu: {e}"))?;
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|e| format!("menu: {e}"))?;
+
+    let settings = MenuItem::new(tr("tray_settings"), true, None);
+    let quit = MenuItem::new(tr("tray_quit"), true, None);
+    menu.append(&settings).map_err(|e| format!("menu: {e}"))?;
+    menu.append(&PredefinedMenuItem::separator())
+        .map_err(|e| format!("menu: {e}"))?;
+    menu.append(&quit).map_err(|e| format!("menu: {e}"))?;
+
+    Ok((
+        menu,
+        settings.id().clone(),
+        quit.id().clone(),
+        mode_items,
+    ))
 }
 
 /// 32x32 RGBA icon: blue disc on transparent background (placeholder).

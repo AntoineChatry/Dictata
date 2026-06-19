@@ -15,7 +15,11 @@ fn main() {
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
 
-    let tray = match Tray::new() {
+    let modes = [
+        ("raw".to_string(), "Brut".to_string()),
+        ("email".to_string(), "Email".to_string()),
+    ];
+    let tray = match Tray::new(&modes, "raw") {
         Ok(t) => t,
         Err(e) => {
             eprintln!("ECHEC construction tray: {e}");

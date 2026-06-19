@@ -61,6 +61,11 @@ pub fn list_installed(model_dir: &str) -> Vec<String> {
     if let Ok(rd) = std::fs::read_dir(model_dir) {
         for e in rd.flatten() {
             if let Some(n) = e.file_name().to_str() {
+                // VAD models (`ggml-silero-*.bin`) are not transcription models:
+                // selecting one as the main model crashes whisper.cpp. Hide them.
+                if n.starts_with("ggml-silero-") {
+                    continue;
+                }
                 if let Some(s) = n.strip_prefix("ggml-").and_then(|s| s.strip_suffix(".bin")) {
                     out.push(s.to_string());
                 } else if n.ends_with(".bin") {
