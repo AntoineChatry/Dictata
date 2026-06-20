@@ -118,8 +118,12 @@ fn run(
 ) -> Result<String, String> {
     let mut buf: Vec<f32> = Vec::new();
     let mut text = String::new();
+    // Normalised form of the last emitted chunk, to drop a chunk that merely
+    // repeats the previous one (Whisper echoes the prompt tail on low-content
+    // chunks during hesitations/pauses).
+    let mut last_norm = String::new();
 
-    let flush = |buf: &mut Vec<f32>, text: &mut String| -> Result<(), String> {
+    let flush = |buf: &mut Vec<f32>, text: &mut String, last_norm: &mut String| -> Result<(), String> {
         let chunk = std::mem::take(buf);
         // Acquire the lock even if poisoned (another thread panicked):
         // an Option<Transcriber> stays coherent, at worst we reload it.
@@ -136,12 +140,21 @@ fn run(
         };
         let prompt = format!("{} {}", params.vocab_prompt, tail).trim().to_string();
         let prompt_opt = if prompt.is_empty() { None } else { Some(prompt.as_str()) };
-        let piece = t.transcribe(&chunk, params.language.as_deref(), false, prompt_opt, params.beam_size, None)?;
-        if !piece.is_empty() {
-            let out = if text.is_empty() { piece } else { format!(" {piece}") };
-            text.push_str(&out);
-            emit(&out);
+        let raw = t.transcribe(&chunk, params.language.as_deref(), false, prompt_opt, params.beam_size, None)?;
+        // Collapse a phrase repeated inside the same chunk ("X X X" -> "X").
+        let piece = collapse_repeats(&raw);
+        if piece.is_empty() {
+            return Ok(());
         }
+        // Drop a chunk that is an exact (normalised) repeat of the previous one.
+        let norm = normalize(&piece);
+        if norm == *last_norm {
+            return Ok(());
+        }
+        *last_norm = norm;
+        let out = if text.is_empty() { piece } else { format!(" {piece}") };
+        text.push_str(&out);
+        emit(&out);
         Ok(())
     };
 
@@ -154,7 +167,7 @@ fn run(
             continue;
         }
         if silence >= PAUSE_S || buf.len() as f32 / SAMPLE_RATE as f32 >= MAX_CHUNK_S {
-            if let Err(e) = flush(&mut buf, &mut text) {
+            if let Err(e) = flush(&mut buf, &mut text, &mut last_norm) {
                 eprintln!("[streaming] chunk: {e}");
             }
         }
@@ -166,7 +179,88 @@ fn run(
     }
     let silence = trailing_silence(&buf);
     if buf.len() as f32 / SAMPLE_RATE as f32 - silence >= 0.3 {
-        flush(&mut buf, &mut text)?;
+        flush(&mut buf, &mut text, &mut last_norm)?;
     }
     Ok(text)
+}
+
+/// Lowercased, punctuation-stripped, whitespace-collapsed form for comparing
+/// two transcribed pieces (used to drop a chunk that repeats the previous one).
+fn normalize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collapses an immediately repeated multi-word block inside a single piece:
+/// `"a b c a b c a b c"` -> `"a b c"`. Only blocks of >= 2 words are collapsed
+/// so genuine single-word stutters ("le chat le chien") are preserved. Words
+/// are compared on their lowercased alphanumeric core, so punctuation/casing
+/// differences ("dégradé," vs "dégradé") still count as a repeat.
+fn collapse_repeats(s: &str) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() < 4 {
+        return s.trim().to_string();
+    }
+    let key: Vec<String> = words
+        .iter()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect()
+        })
+        .collect();
+
+    let mut out: Vec<usize> = Vec::with_capacity(words.len());
+    for i in 0..words.len() {
+        out.push(i);
+        loop {
+            let n = out.len();
+            let mut collapsed = false;
+            // Largest block first so "x x x x" collapses fully.
+            for b in (2..=n / 2).rev() {
+                if (0..b).all(|k| key[out[n - b + k]] == key[out[n - 2 * b + k]]) {
+                    out.truncate(n - b);
+                    collapsed = true;
+                    break;
+                }
+            }
+            if !collapsed {
+                break;
+            }
+        }
+    }
+    out.into_iter().map(|i| words[i]).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapse_repeated_phrase() {
+        let s = "DMOT score partiellement dégradé, DMOT score partiellement dégradé, \
+                 DMOT score partiellement dégradé";
+        assert_eq!(collapse_repeats(s), "DMOT score partiellement dégradé,");
+    }
+
+    #[test]
+    fn collapse_preserves_non_repeats() {
+        assert_eq!(collapse_repeats("le chat et le chien"), "le chat et le chien");
+    }
+
+    #[test]
+    fn collapse_keeps_short_pieces() {
+        assert_eq!(collapse_repeats("oui oui"), "oui oui");
+    }
+
+    #[test]
+    fn normalize_matches_punctuation_variants() {
+        assert_eq!(normalize("Dégradé,"), normalize("dégradé"));
+    }
 }

@@ -57,10 +57,24 @@ pub fn paste_text_with_delay(text: &str, restore_delay: f32) -> Result<(), Strin
     std::thread::sleep(Duration::from_millis(40));
     press_paste()?;
 
-    // Restore the previous content after the paste has happened.
+    // Restore the previous content after the paste has been consumed. Electron
+    // apps (e.g. LM Studio) read the clipboard *asynchronously* on Ctrl+V, so a
+    // synchronous restore can win the race and make them paste the previous
+    // content (Notepad reads synchronously, hence no issue there). Restore
+    // off-thread and only if our text is still on the clipboard: a generous
+    // delay then neither blocks the caller (next streaming chunk / one-shot)
+    // nor clobbers a more recent paste.
     if let Some(prev) = previous {
-        std::thread::sleep(Duration::from_secs_f32(restore_delay.clamp(0.0, 5.0)));
-        let _ = set_clipboard(&prev);
+        let pasted = text.to_owned();
+        let delay = restore_delay.clamp(0.0, 5.0);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs_f32(delay));
+            if let Ok(mut c) = Clipboard::new() {
+                if c.get_text().ok().as_deref() == Some(pasted.as_str()) {
+                    let _ = c.set_text(prev);
+                }
+            }
+        });
     }
     Ok(())
 }

@@ -65,7 +65,7 @@ fn default_audio_source() -> String {
     "mic".into()
 }
 fn default_paste_restore_delay() -> f32 {
-    0.5
+    1.0
 }
 fn default_max_record_seconds() -> u32 {
     600
