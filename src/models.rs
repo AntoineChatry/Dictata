@@ -35,10 +35,17 @@ pub const CATALOG: &[CatalogEntry] = &[
 pub fn file_name(model: &str) -> String {
     // Custom models (HuggingFace search) are stored under their full file
     // name; catalog names keep the `ggml-{name}.bin` scheme.
-    if model.ends_with(".bin") {
-        model.to_string()
+    // Only the last path component is kept: a hand-edited `model` must never
+    // escape `model_dir`, since `model_path` feeds `delete` and `Path::join`
+    // silently discards the base when joined with an absolute path.
+    let leaf = Path::new(model)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if leaf.ends_with(".bin") {
+        leaf.to_string()
     } else {
-        format!("ggml-{model}.bin")
+        format!("ggml-{leaf}.bin")
     }
 }
 
@@ -119,7 +126,7 @@ pub fn download_url(
     fname: &str,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(model_dir).map_err(|e| format!("dossier modeles: {e}"))?;
+    std::fs::create_dir_all(model_dir).map_err(|e| format!("models directory: {e}"))?;
     let dest = Path::new(model_dir).join(fname);
     let tmp = dest.with_extension("part");
 
@@ -127,26 +134,43 @@ pub fn download_url(
     let mut resp = reqwest::blocking::Client::new()
         .get(url)
         .send()
-        .map_err(|e| format!("requete: {e}"))?;
+        .map_err(|e| format!("request: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("HTTP {} pour {url}", resp.status()));
+        return Err(format!("HTTP {} for {url}", resp.status()));
     }
     let total = resp.content_length();
 
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("creation fichier: {e}"))?;
-    let mut buf = [0u8; 65536];
-    let mut received = 0u64;
-    loop {
-        let n = resp.read(&mut buf).map_err(|e| format!("lecture flux: {e}"))?;
-        if n == 0 {
-            break;
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("file creation: {e}"))?;
+    let transfer = (|| -> Result<(), String> {
+        let mut buf = [0u8; 65536];
+        let mut received = 0u64;
+        loop {
+            let n = resp.read(&mut buf).map_err(|e| format!("stream read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+            received += n as u64;
+            progress(received, total);
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("ecriture: {e}"))?;
-        received += n as u64;
-        progress(received, total);
-    }
+        // Belt and braces: the reader already fails on a body shorter than the
+        // announced length, but a stream ending early on a valid frame would
+        // otherwise be committed as a complete model.
+        match total {
+            Some(total) if received != total => Err(format!(
+                "incomplete download ({received}/{total} bytes), model not installed"
+            )),
+            _ => Ok(()),
+        }
+    })();
     drop(file);
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("renommage: {e}"))?;
+    // Never leave a `.part` behind: a failed download must not litter
+    // `model_dir` nor leave a stale partial file for the next attempt.
+    if let Err(e) = transfer {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename: {e}"))?;
     Ok(dest)
 }
 
@@ -171,7 +195,7 @@ fn hf_get(url: &str) -> Result<serde_json::Value, String> {
         .get(url)
         .timeout(std::time::Duration::from_secs(15))
         .send()
-        .map_err(|e| format!("requete: {e}"))?;
+        .map_err(|e| format!("request: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -228,10 +252,9 @@ pub enum HfQuery {
 
 pub fn parse_hf_query(input: &str) -> HfQuery {
     let s = input.trim().trim_end_matches('/');
-    if let Some(rest) = s
-        .strip_prefix("https://huggingface.co/")
-        .or_else(|| s.strip_prefix("http://huggingface.co/"))
-    {
+    // https only: keeping the `http://` prefix would download the model over a
+    // downgradable connection. HuggingFace serves https and redirects anyway.
+    if let Some(rest) = s.strip_prefix("https://huggingface.co/") {
         // File URL: https://huggingface.co/owner/name/resolve/main/file.bin
         if rest.contains("/resolve/") || rest.contains("/blob/") {
             let fname = rest.rsplit('/').next().unwrap_or("model.bin").to_string();
@@ -276,6 +299,58 @@ mod tests {
         assert_eq!(file_name("small-q5_1"), "ggml-small-q5_1.bin");
         // Custom models keep their full file name.
         assert_eq!(file_name("whisper-large-zh.bin"), "whisper-large-zh.bin");
+    }
+
+    #[test]
+    fn download_url_rejects_truncated() {
+        // Server announcing 100 bytes but sending 10, then closing cleanly.
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = srv.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = srv.accept() {
+                let mut junk = [0u8; 1024];
+                let _ = s.read(&mut junk);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789");
+                let _ = s.flush();
+            }
+        });
+        let dir = std::env::temp_dir().join("dictata_trunc_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let res = download_url(
+            dir.to_str().unwrap(),
+            &format!("http://127.0.0.1:{port}/x.bin"),
+            "x.bin",
+            |_, _| {},
+        );
+        let err = res.expect_err("a truncated download must not succeed");
+        assert!(!dir.join("x.bin").exists(), "truncated file was installed: {err}");
+        assert!(!dir.join("x.part").exists(), "leftover .part: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("truncated download rejected by: {err}");
+    }
+
+    #[test]
+    fn file_name_catalog_unchanged() {
+        // The whole catalog must keep the plain `ggml-{name}.bin` scheme.
+        for e in CATALOG {
+            assert_eq!(file_name(e.name), format!("ggml-{}.bin", e.name));
+        }
+        assert_eq!(file_name(VAD_MODEL_FILE), VAD_MODEL_FILE);
+    }
+
+    #[test]
+    fn file_name_stays_in_model_dir() {
+        // Only the last component survives: `model_path` feeds `delete`.
+        assert_eq!(file_name("../../evil.bin"), "evil.bin");
+        assert_eq!(file_name("..\\..\\evil.bin"), "evil.bin");
+        assert_eq!(file_name("C:\\Windows\\System32\\evil.bin"), "evil.bin");
+        assert_eq!(file_name("/etc/passwd.bin"), "passwd.bin");
+        // A name that is only traversal resolves to no usable file.
+        assert_eq!(file_name(".."), "ggml-.bin");
+        for m in ["../../evil.bin", "C:\\Windows\\evil.bin", ".."] {
+            let p = model_path("F:\\models", m);
+            assert_eq!(p.parent(), Some(Path::new("F:\\models")), "escaped: {m}");
+        }
     }
 
     #[test]

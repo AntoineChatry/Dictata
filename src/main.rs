@@ -279,6 +279,26 @@ impl App {
         }
     }
 
+    /// Push-to-talk, key down: starts a take, with the same guards as
+    /// [`Self::toggle`]. A take already running is left alone.
+    fn ptt_press(&mut self, ctx: &egui::Context) {
+        match self.state {
+            State::Idle | State::Flash { .. } => self.start_recording(ctx),
+            State::Recording { .. } => {}   // already recording: ignore
+            State::Transcribing => {}       // busy: ignore
+            State::Positioning { .. } => {} // positioning in progress: ignore
+        }
+    }
+
+    /// Push-to-talk, key up: ends the take. A release received in any other
+    /// state (take refused because busy, shortcut changed mid-press) is
+    /// ignored; `max_record_seconds` remains the safety net if it never comes.
+    fn ptt_release(&mut self, ctx: &egui::Context) {
+        if matches!(self.state, State::Recording { .. }) {
+            self.stop_and_transcribe(ctx);
+        }
+    }
+
     /// Ends positioning: stores the window's current position.
     fn finish_positioning(&mut self, ctx: &egui::Context) {
         if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
@@ -530,9 +550,18 @@ impl eframe::App for App {
             self.no_activate_done = true;
         }
 
-        // Global hotkey events.
+        // Global hotkey events. In push-to-talk the take follows the key
+        // (down starts, up stops); in toggle mode only the press counts.
         for (id, st) in hotkey::poll_events() {
-            if st == HotKeyState::Pressed && Some(id) == self.hotkey_id {
+            if Some(id) != self.hotkey_id {
+                continue;
+            }
+            if self.cfg.activation == "push_to_talk" {
+                match st {
+                    HotKeyState::Pressed => self.ptt_press(&ctx),
+                    HotKeyState::Released => self.ptt_release(&ctx),
+                }
+            } else if st == HotKeyState::Pressed {
                 self.toggle(&ctx);
             }
         }

@@ -9,7 +9,9 @@ arboard = "3"
 cpal = "0.18.1"
 eframe = "0.34.3"
 enigo = "0.6"
-global-hotkey = "0.7"
+# 0.8 minimum: below that, the Windows release-detection loop busy-spins a
+# whole CPU core for the entire key hold (push-to-talk). See upstream #178.
+global-hotkey = "0.8"
 rfd = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 indexmap = { version = "2.14.0", features = ["serde"] }
