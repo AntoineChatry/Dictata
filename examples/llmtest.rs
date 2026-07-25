@@ -47,7 +47,7 @@ fn main() {
     let clean = full.modes.get("clean").unwrap().clone();
     let raw = "euh donc voila je voulais juste euh dire que le projet avance bien hum";
 
-    let (out, status) = modes::apply_mode(raw, &clean, &full);
+    let (out, status) = modes::apply_mode(raw, &clean, &full, Some("french"));
     println!("status = {status}");
     println!("--- entree ---\n{raw}\n--- sortie LLM ---\n{out}\n--------------");
 
