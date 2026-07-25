@@ -60,16 +60,56 @@ pub fn build_initial_prompt(vocabulary: &[String], base_prompt: &str) -> String 
     parts.join(" ").trim().to_string()
 }
 
+/// System prompt for a take, with an explicit output-language directive when
+/// the language is known.
+///
+/// The mode prompts are written in English, and small local models follow the
+/// language of the system prompt over a rule buried inside it: a French
+/// dictation comes back translated into English (measured on qwen3-4b).
+///
+/// Both the placement and the wording were measured on qwen3-4b, because the
+/// obvious phrasings silently disable the mode:
+///
+/// - Appended *after* the mode prompt, the directive becomes the last and
+///   dominant instruction and the model returns a near verbatim copy, losing
+///   the mode's formatting entirely.
+/// - Any wording containing "never translate it" is read as "reproduce the
+///   input faithfully" and has the same effect, even as a prefix: a short
+///   dictation came back unchanged instead of being formatted as an email.
+///
+/// A bare setting line, before the mode prompt, sets the language without
+/// implying fidelity, and leaves the mode's own rules last and strongest.
+fn prompt_for_language(base: &str, language: Option<&str>) -> String {
+    match language {
+        Some(lang) if !lang.is_empty() => format!("Output language: {lang}.\n\n{base}"),
+        _ => base.to_string(),
+    }
+}
+
 /// Returns `(final_text, status)`.
 /// status: "raw", "llm" (reformatted) or "llm_fallback" (LLM unavailable -> raw).
-pub fn apply_mode(raw_text: &str, mode: &Mode, cfg: &Config) -> (String, &'static str) {
+/// `language` is the full English name of the dictation language as detected
+/// by whisper (e.g. "french"), or `None` when it is unknown.
+pub fn apply_mode(
+    raw_text: &str,
+    mode: &Mode,
+    cfg: &Config,
+    language: Option<&str>,
+) -> (String, &'static str) {
     let text = apply_replacements(raw_text, &cfg.replacements);
 
     if mode.kind == "llm" && !mode.prompt.is_empty() {
         if !cfg.llm.enabled {
             return (text, "llm_fallback");
         }
-        return match llm::transform(&text, &mode.prompt, &cfg.llm) {
+        // A mode that deliberately translates must not be pinned to the
+        // source language.
+        let sys = if mode.task == "translate" {
+            mode.prompt.clone()
+        } else {
+            prompt_for_language(&mode.prompt, language)
+        };
+        return match llm::transform(&text, &sys, &cfg.llm) {
             Ok(t) if !t.is_empty() => (t, "llm"),
             Ok(_) => (text, "llm"),
             Err(_) => (text, "llm_fallback"),
@@ -113,7 +153,7 @@ mod tests {
     fn raw_mode_returns_raw() {
         let cfg = Config::default();
         let mode = cfg.modes.get("raw").unwrap().clone();
-        let (text, status) = apply_mode("  bonjour  ", &mode, &cfg);
+        let (text, status) = apply_mode("  bonjour  ", &mode, &cfg, None);
         assert_eq!(status, "raw");
         assert_eq!(text, "  bonjour  "); // raw does not trim whitespace
     }
@@ -122,7 +162,7 @@ mod tests {
     fn llm_mode_disabled_falls_back() {
         let cfg = Config::default(); // llm.enabled = false
         let mode = cfg.modes.get("email").unwrap().clone();
-        let (text, status) = apply_mode("ceci est un test", &mode, &cfg);
+        let (text, status) = apply_mode("ceci est un test", &mode, &cfg, None);
         assert_eq!(status, "llm_fallback");
         assert_eq!(text, "ceci est un test");
     }

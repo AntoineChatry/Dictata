@@ -115,22 +115,24 @@ fn build_menu(
     ))
 }
 
-/// 32x32 RGBA icon: blue disc on transparent background (placeholder).
+const TRAY_ICON_SIZE: u32 = 32;
+
+/// Pre-rendered 32x32 RGBA, produced by `scripts/make-icon.ps1` from the same
+/// drawing as `assets/dictata.ico`, so the notification area and the
+/// executable show the same microphone instead of two different marks.
+///
+/// The buffer is embedded raw rather than decoded from the `.ico` at startup:
+/// that keeps an ICO decoder out of the application, and turns "is the icon
+/// the right shape?" into a compile-time fact rather than a runtime failure.
+const TRAY_ICON_RGBA: &[u8] = include_bytes!("../assets/tray32.rgba");
+
+const _: () = assert!(
+    TRAY_ICON_RGBA.len() == (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize,
+    "assets/tray32.rgba must be 32x32 RGBA - re-run scripts/make-icon.ps1"
+);
+
 fn make_icon() -> Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let (cx, cy, r) = (15.5f32, 15.5f32, 13.0f32);
-    for y in 0..h {
-        for x in 0..w {
-            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-            if dx * dx + dy * dy <= r * r {
-                let i = ((y * w + x) * 4) as usize;
-                rgba[i] = 0x4a;
-                rgba[i + 1] = 0x90;
-                rgba[i + 2] = 0xe2;
-                rgba[i + 3] = 0xff;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, w, h).expect("icone rgba")
+    // Cannot fail: the length is checked above and the size is a constant.
+    Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)
+        .expect("icone tray 32x32 RGBA")
 }

@@ -29,6 +29,33 @@ pub fn history_path() -> PathBuf {
     home_dir().join("history.jsonl")
 }
 
+/// Marker written while a model is being loaded, removed once it succeeded.
+///
+/// A malformed ggml file makes whisper.cpp call `abort()`, which no `Result`
+/// and no `catch_unwind` can intercept: the process simply disappears, and a
+/// release build has no console to say why. Since the faulty model stays in the
+/// config, the next launch crashes again, and the user has no way out. The
+/// marker survives the abort and lets the next start break that loop.
+///
+/// Kept out of `model_dir` so it never shows up in the installed-model list.
+pub fn model_sentinel_path() -> PathBuf {
+    home_dir().join("model_loading.tmp")
+}
+
+/// Decides what a leftover sentinel means. Returns the offending model file
+/// name when the *configured* model is the one that failed to load, so the
+/// caller can fall back to the default; `None` when there is nothing to do.
+///
+/// A sentinel naming another model (a one-off file transcription can load a
+/// different one) must not reset the user's main choice.
+pub fn recover_from_sentinel(sentinel: Option<&str>, current_model: &str) -> Option<String> {
+    let leaf = sentinel?.trim();
+    if leaf.is_empty() {
+        return None;
+    }
+    (leaf == crate::models::file_name(current_model)).then(|| leaf.to_string())
+}
+
 pub fn default_model_dir() -> String {
     home_dir().join("models").to_string_lossy().into_owned()
 }
@@ -43,7 +70,7 @@ fn default_activation() -> String {
 fn default_true() -> bool {
     true
 }
-fn default_model() -> String {
+pub fn default_model() -> String {
     "base".into()
 }
 fn default_gpu() -> String {
@@ -72,6 +99,9 @@ fn default_max_record_seconds() -> u32 {
 }
 fn default_beam_size() -> i32 {
     5
+}
+fn default_history_limit() -> usize {
+    500
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -183,6 +213,23 @@ pub struct Config {
     pub modes: IndexMap<String, Mode>,
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Auto-select the mode from the active application (Windows/X11 only).
+    #[serde(default)]
+    pub auto_mode: bool,
+    /// Map of executable name (lowercased, e.g. "outlook.exe") -> mode key.
+    #[serde(default)]
+    pub app_modes: IndexMap<String, String>,
+    /// Amplify quiet recordings before transcription (soft-voice dictation).
+    #[serde(default)]
+    pub low_voice: bool,
+    /// Record each dictation in `history.jsonl`. The file is plain text next to
+    /// the executable: convenient, but it is every dictation ever made, so it
+    /// must be possible to turn off.
+    #[serde(default = "default_true")]
+    pub save_history: bool,
+    /// Maximum number of entries kept in the history; older ones are dropped.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
 }
 
 impl Default for Config {
@@ -212,6 +259,11 @@ impl Default for Config {
             active_mode: default_active_mode(),
             modes: default_modes(),
             llm: LlmConfig::default(),
+            auto_mode: false,
+            app_modes: IndexMap::new(),
+            low_voice: false,
+            save_history: true,
+            history_limit: default_history_limit(),
         }
     }
 }
@@ -391,6 +443,39 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.modes.len(), 5);
         assert_eq!(back.llm.base_url, "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn sentinel_only_resets_the_configured_model() {
+        // No sentinel: nothing to recover.
+        assert_eq!(recover_from_sentinel(None, "base"), None);
+        // Empty or blank sentinel: treated as absent rather than as a crash.
+        assert_eq!(recover_from_sentinel(Some(""), "base"), None);
+        assert_eq!(recover_from_sentinel(Some("  \n"), "base"), None);
+        // The configured model is the one that died: fall back.
+        assert_eq!(
+            recover_from_sentinel(Some("ggml-base.bin"), "base"),
+            Some("ggml-base.bin".to_string())
+        );
+        // Custom models are stored under their full file name.
+        assert_eq!(
+            recover_from_sentinel(Some("whisper-large-zh.bin"), "whisper-large-zh.bin"),
+            Some("whisper-large-zh.bin".to_string())
+        );
+        // Another model died (a one-off file transcription can load its own):
+        // the user's main choice must be left alone.
+        assert_eq!(recover_from_sentinel(Some("ggml-small.bin"), "base"), None);
+    }
+
+    #[test]
+    fn history_settings_default_and_survive_old_configs() {
+        let cfg = Config::default();
+        assert!(cfg.save_history);
+        assert_eq!(cfg.history_limit, 500);
+        // A config written before these keys existed must still load.
+        let back: Config = serde_json::from_str(r#"{"model":"small"}"#).unwrap();
+        assert!(back.save_history);
+        assert_eq!(back.history_limit, 500);
     }
 
     #[test]

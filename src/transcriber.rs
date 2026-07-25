@@ -32,6 +32,16 @@ impl Transcriber {
                 model_path.display()
             ));
         }
+        // whisper.cpp aborts the process on a malformed ggml file rather than
+        // returning an error, so leave a marker naming the model being loaded.
+        // A start that finds it knows the previous run died here. Written for
+        // every caller by living in `load` rather than at the three call sites.
+        let loading = model_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let _ = std::fs::write(crate::config::model_sentinel_path(), &loading);
+
         let mut params = WhisperContextParameters::default();
         params.use_gpu(gpu);
         // Flash attention shrinks the attention buffers (and is faster). Gated
@@ -50,6 +60,8 @@ impl Transcriber {
             .map(|n| n.get() as i32)
             .unwrap_or(4)
             .clamp(1, 8);
+        // Loaded without dying: the marker has done its job.
+        let _ = std::fs::remove_file(crate::config::model_sentinel_path());
         Ok(Transcriber { state, n_threads })
     }
 
@@ -134,6 +146,19 @@ impl Transcriber {
             }
         }
         Ok(text.trim().to_string())
+    }
+
+    /// Full English name of the language of the last [`Self::transcribe`]
+    /// call (e.g. "french"), from whisper's own detection. Used to tell the
+    /// LLM which language to answer in: an English system prompt otherwise
+    /// pushes small local models to translate the dictation.
+    /// `None` before any transcription or if the id is unknown.
+    pub fn detected_language(&self) -> Option<&'static str> {
+        let id = self.state.full_lang_id_from_state();
+        if id < 0 {
+            return None;
+        }
+        whisper_rs::get_lang_str_full(id)
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{Config, Mode};
 use crate::i18n::tr;
-use crate::settings_logic::{capitalize, normalize_mode_key, parse_repl, parse_vocab, pretty_token, transcribe_file};
+use crate::settings_logic::{capitalize, llm_endpoint_is_local, normalize_mode_key, parse_app_modes, parse_repl, parse_vocab, pretty_token, transcribe_file};
 use crate::{audio, hardware, history, llm, models, paste};
 
 // ---------- palette (modern dark, purple accent — Raycast/Linear style) ----------
@@ -33,6 +33,7 @@ const ACCENT: Color32 = Color32::from_rgb(0x8b, 0x7c, 0xff);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(0xb4, 0xab, 0xff);
 const OK: Color32 = Color32::from_rgb(0x5a, 0xd2, 0x8c);
 const BAD: Color32 = Color32::from_rgb(0xe0, 0x55, 0x55);
+const WARN: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x5a);
 const DARK_ON_ACCENT: Color32 = Color32::from_rgb(0x12, 0x0c, 0x2e);
 
 // (i18n key, transcription language code)
@@ -108,7 +109,18 @@ pub struct SettingsState {
     new_mode_name: String,
     vocab_text: String,
     repl_text: String,
+    app_modes_text: String,
+    /// Executable and title of the window focused during the last take,
+    /// shown in the auto-mode card: a release build has no console, so this
+    /// is the only way to see what a rule has to match.
+    pub last_window: Option<(String, String)>,
     capturing_hotkey: bool,
+    /// Directory listing behind the Models page, so it is not re-read from disk
+    /// on every frame: the page repaints at ~60 fps and did one `read_dir` plus
+    /// one `exists()` per catalog entry each time. Keyed by the directory and
+    /// refreshed on a short interval; set to `None` to force a refresh after an
+    /// action that changes the folder.
+    models_cache: Option<(String, std::time::Instant, Vec<String>)>,
     download: Option<Download>,
     llm_status: Option<bool>,
     history: Vec<history::Entry>,
@@ -124,6 +136,11 @@ pub struct SettingsState {
     hf_error: Option<String>,
     hf_task: Option<Arc<Mutex<Option<HfOutcome>>>>,
 }
+
+/// How long the Models page reuses a directory listing before re-reading it.
+/// Short enough that a file added outside the app shows up promptly, long
+/// enough that a 60 fps repaint does not hammer the disk.
+const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Result of a HuggingFace fetch (search or repo file listing).
 enum HfOutcome {
@@ -153,6 +170,12 @@ impl SettingsState {
             .map(|(k, v)| format!("{k} = {v}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let app_modes_text = cfg
+            .app_modes
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let history = history::read_entries(100);
         SettingsState {
             cfg,
@@ -164,7 +187,10 @@ impl SettingsState {
             new_mode_name: String::new(),
             vocab_text,
             repl_text,
+            app_modes_text,
+            last_window: None,
             capturing_hotkey: false,
+            models_cache: None,
             download: None,
             llm_status: None,
             history,
@@ -182,6 +208,22 @@ impl SettingsState {
     /// Sets a status message (shown in the footer).
     pub fn set_status(&mut self, msg: &str) {
         self.status = msg.to_string();
+    }
+
+    /// Cached `.bin` listing of `dir`, re-read at most every `MODELS_CACHE_TTL`.
+    fn installed_files(&mut self, dir: &str) -> &[String] {
+        let stale = match &self.models_cache {
+            Some((cached_dir, at, _)) => cached_dir != dir || at.elapsed() >= MODELS_CACHE_TTL,
+            None => true,
+        };
+        if stale {
+            self.models_cache = Some((
+                dir.to_string(),
+                std::time::Instant::now(),
+                models::installed_files(dir),
+            ));
+        }
+        &self.models_cache.as_ref().expect("just populated above").2
     }
 }
 
@@ -624,6 +666,7 @@ pub fn render(ui: &mut egui::Ui, st: &mut SettingsState) -> RenderResult {
     if res.save {
         st.cfg.vocabulary = parse_vocab(&st.vocab_text);
         st.cfg.replacements = parse_repl(&st.repl_text);
+        st.cfg.app_modes = parse_app_modes(&st.app_modes_text);
         if !st.cfg.modes.contains_key(&st.cfg.active_mode) {
             st.cfg.active_mode = "raw".into();
         }
@@ -863,6 +906,10 @@ fn page_config(ui: &mut egui::Ui, st: &mut SettingsState) {
             toggle(ui, &mut st.cfg.vad);
         });
         ui.add_space(4.0);
+        row(ui, tr("cfg_lowvoice"), tr("cfg_lowvoice_hint"), |ui| {
+            toggle(ui, &mut st.cfg.low_voice);
+        });
+        ui.add_space(4.0);
         row(ui, tr("cfg_ui_lang"), tr("cfg_ui_lang_hint"), |ui| {
             let cur = UI_LANGS
                 .iter()
@@ -878,6 +925,34 @@ fn page_config(ui: &mut egui::Ui, st: &mut SettingsState) {
                     }
                 });
         });
+    });
+    ui.add_space(10.0);
+    card(ui, Some(tr("cfg_automode_card")), |ui| {
+        row(ui, tr("cfg_automode"), tr("cfg_automode_hint"), |ui| {
+            toggle(ui, &mut st.cfg.auto_mode);
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(tr("cfg_automode_map_hint")).color(DIM).size(12.0));
+        ui.add(
+            egui::TextEdit::multiline(&mut st.app_modes_text)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
+        if let Some((exe, title)) = st.last_window.clone() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(tr("cfg_automode_last")).color(DIM).size(12.0));
+            let detected = if title.is_empty() {
+                exe
+            } else {
+                format!("{exe}  |  {title}")
+            };
+            // Selectable so the exact string can be copied into a rule.
+            ui.add(egui::Label::new(RichText::new(detected).monospace().size(12.0)).selectable(true));
+        }
+        if !st.cfg.llm.enabled {
+            ui.add_space(6.0);
+            ui.label(RichText::new(tr("cfg_automode_llm_warn")).color(WARN).size(12.0));
+        }
     });
     ui.add_space(10.0);
     card(ui, Some(tr("cfg_dock_card")), |ui| {
@@ -986,6 +1061,7 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         });
         if done {
             st.download = None;
+            st.models_cache = None; // a model was just added (or failed to be)
             let msg = match &err {
                 Some(e) => format!("{} {e}", tr("models_dl_error")),
                 None => tr("models_installed_ok").to_string(),
@@ -1035,9 +1111,11 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         });
     });
 
-    // Installed models.
+    // Installed models. One directory listing, reused by both cards below and
+    // cached across frames: this page repaints at ~60 fps.
     let dir = st.cfg.model_dir.clone();
-    let installed = models::list_installed(&dir);
+    let model_files: Vec<String> = st.installed_files(&dir).to_vec();
+    let installed = models::list_installed_from(&model_files);
     card(ui, Some(tr("models_installed")), |ui| {
         if installed.is_empty() {
             ui.label(RichText::new(tr("models_none")).color(DIM));
@@ -1055,7 +1133,7 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         ui.add_space(2.0);
         for c in models::CATALOG {
             let active = st.cfg.model == c.name;
-            let inst = models::is_installed(&dir, c.name);
+            let inst = models::is_installed_among(&model_files, c.name);
             let rating = hardware::rate(c.name, &st.hw, hardware::gpu_active(&st.hw, &st.cfg.gpu));
             let badge = if !rating.label.is_empty() {
                 Some((rating.label.clone(), rating_color(rating.level)))
@@ -1145,7 +1223,7 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
                         ui.label(RichText::new(format!("{} Mo", s / 1_000_000)).color(DIM).size(11.0));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if models::is_installed(&dir, &f.fname) {
+                        if models::is_installed_among(&model_files, &f.fname) {
                             ui.label(RichText::new(tr("models_done")).color(OK));
                         } else if st.download.is_none() {
                             if ui.button(tr("models_download")).clicked() {
@@ -1216,6 +1294,7 @@ fn model_row(
                                 Ok(()) => tr("models_deleted").to_string(),
                                 Err(e) => format!("{} {e}", tr("models_del_error")),
                             };
+                            st.models_cache = None; // the folder just changed
                             st.set_status(&msg);
                         }
                         let b = egui::Button::new(RichText::new(tr("models_use")).color(DARK_ON_ACCENT).strong())
@@ -1248,6 +1327,13 @@ fn page_llm(ui: &mut egui::Ui, st: &mut SettingsState) {
         row(ui, tr("llm_url"), tr("llm_url_hint"), |ui| {
             ui.add(egui::TextEdit::singleline(&mut st.cfg.llm.base_url).desired_width(280.0));
         });
+        // A non-loopback endpoint sends every dictation off this machine, which
+        // contradicts what the application promises. The setting stays free;
+        // this only makes the consequence visible.
+        if llm_endpoint_is_local(&st.cfg.llm.base_url) == Some(false) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("llm_remote_warn")).color(WARN).size(12.0));
+        }
         ui.add_space(4.0);
         row(ui, tr("llm_model"), "", |ui| {
             ui.add(egui::TextEdit::singleline(&mut st.cfg.llm.model).desired_width(280.0));
@@ -1302,6 +1388,22 @@ fn page_history(ui: &mut egui::Ui, st: &mut SettingsState) {
         }
         ui.label(RichText::new(tr("hist_hint")).color(DIM).size(12.0));
     });
+    ui.add_space(6.0);
+    card(ui, None, |ui| {
+        row(ui, tr("hist_enable"), tr("hist_enable_hint"), |ui| {
+            toggle(ui, &mut st.cfg.save_history);
+        });
+        if st.cfg.save_history {
+            ui.add_space(4.0);
+            row(ui, tr("hist_limit"), tr("hist_limit_hint"), |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut st.cfg.history_limit)
+                        .range(10..=100_000)
+                        .speed(10),
+                );
+            });
+        }
+    });
     // Collects the file transcription result.
     if let Some(ft) = &st.filetx {
         let done = ft.done.lock().unwrap().take();
@@ -1310,7 +1412,7 @@ fn page_history(ui: &mut egui::Ui, st: &mut SettingsState) {
             match res {
                 Ok(text) => {
                     let _ = paste::set_clipboard(&text);
-                    history::add_entry(&text, &st.cfg.active_mode, None, None);
+                    history::add_entry(&st.cfg, &text, &st.cfg.active_mode, None, None);
                     st.history = history::read_entries(100);
                     st.status = tr("filetx_done").into();
                 }

@@ -23,7 +23,7 @@ use dictata::transcriber::Transcriber;
 use dictata::tray::{Tray, TrayAction};
 use dictata::i18n::tr;
 use dictata::streaming::{StreamParams, StreamingSession};
-use dictata::{history, i18n, modes, paste, platform};
+use dictata::{history, i18n, modes, paste, platform, settings_logic};
 
 /// Path of the ggml model file from the configured name (e.g. "tiny").
 fn model_file_path(cfg: &Config) -> PathBuf {
@@ -31,9 +31,20 @@ fn model_file_path(cfg: &Config) -> PathBuf {
 }
 
 /// Result returned by the transcription thread.
+///
+/// Carries the take it belongs to: results arrive one or more frames after the
+/// take ended, by which time a new take may already have replaced the
+/// application's current mode. Reading `take_mode` on reception logged the
+/// wrong mode in the history; `id` likewise makes cancellation exact instead of
+/// dropping whichever message happens to arrive first.
 enum Worker {
-    Ok { text: String, status: &'static str },
-    Err(String),
+    Ok {
+        id: u64,
+        text: String,
+        status: &'static str,
+        mode: String,
+    },
+    Err(u64, String),
 }
 
 enum State {
@@ -67,15 +78,32 @@ struct App {
     stream: Option<StreamingSession>,
     /// Worker of the last streaming session: joined before starting another.
     stream_join: Option<std::thread::JoinHandle<()>>,
+    /// Mode key resolved for the current take. Auto-mode may override
+    /// `cfg.active_mode` based on the foreground app captured at record start.
+    take_mode: String,
+    /// Monotonic id of the current take, attached to its worker results.
+    take_id: u64,
+    /// Id of a cancelled take whose worker still owes one result, so exactly
+    /// that message is dropped and no other.
+    cancelled_take: Option<u64>,
+    /// Escape-hold gesture for the take in progress (see `platform`).
+    cancel_gesture: platform::CancelGesture,
+    /// Foreground window seen at the last record start, surfaced in the
+    /// settings so a rule can be written against what is actually detected.
+    last_window: Option<(String, String)>,
+    /// One-off message to flash on the dock shortly after startup (model
+    /// recovered after a crash). Shown from the second frame, so it does not
+    /// race the initial "hide the dock" viewport command.
+    startup_notice: Option<&'static str>,
 }
 
 impl App {
     fn new(cfg: Config) -> Self {
-        let mut hotkeys = Hotkeys::new().expect("init raccourci global");
+        let mut hotkeys = Hotkeys::new().expect("global hotkey init");
         let hotkey_id = match hotkeys.set(&cfg.hotkey) {
             Ok(id) => Some(id),
             Err(e) => {
-                eprintln!("raccourci: {e}");
+                eprintln!("hotkey: {e}");
                 None
             }
         };
@@ -94,6 +122,7 @@ impl App {
             dock.mode_label = m.label.clone();
         }
         let recorder = Recorder::new(cfg.input_device.clone(), cfg.audio_source.clone());
+        let take_mode = cfg.active_mode.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let settings = if std::env::var("DICTATA_OPEN_SETTINGS").is_ok() {
             Some(SettingsState::new(cfg.clone()))
@@ -118,6 +147,12 @@ impl App {
             settings_warmup: 0,
             stream: None,
             stream_join: None,
+            take_mode,
+            take_id: 0,
+            cancelled_take: None,
+            cancel_gesture: platform::CancelGesture::new(false),
+            last_window: None,
+            startup_notice: None,
         }
     }
 
@@ -214,7 +249,7 @@ impl App {
         if hotkey_changed {
             match self._hotkeys.set(&self.cfg.hotkey) {
                 Ok(id) => self.hotkey_id = Some(id),
-                Err(e) => eprintln!("raccourci: {e}"),
+                Err(e) => eprintln!("hotkey: {e}"),
             }
         }
         if model_changed {
@@ -299,6 +334,63 @@ impl App {
         }
     }
 
+    /// Escape during a take: drop the audio without transcribing or pasting.
+    /// In streaming mode the chunks already pasted stay pasted (they left the
+    /// application as they were produced); only the remainder is dropped.
+    fn cancel_recording(&mut self, ctx: &egui::Context) {
+        self.abort_take(ctx, "Escape", tr("status_cancelled"), 1.0);
+    }
+
+    /// Ends the current take without transcribing or pasting, and shows
+    /// `status` on the dock. `reason` is a short diagnostic tag; it never
+    /// carries dictated content.
+    fn abort_take(&mut self, ctx: &egui::Context, reason: &str, status: &str, secs: f32) {
+        if !matches!(self.state, State::Recording { .. }) {
+            return;
+        }
+        if let Some(session) = self.stream.take() {
+            let _ = self.recorder.stop();
+            // The worker still reports back once; swallow that one result so the
+            // "cancelled" feedback is not overwritten by an "empty take" one.
+            self.cancelled_take = Some(self.take_id);
+            self.stream_join = Some(session.cancel());
+        } else {
+            let _ = self.recorder.stop();
+        }
+        eprintln!("[state] take aborted ({reason})");
+        self.flash(ctx, DockState::Error, status, secs);
+    }
+
+    /// Mode key to use for the next take. With auto-mode on, the foreground
+    /// application (captured now, while it still holds focus) may select a
+    /// mapped mode; otherwise the manually chosen `active_mode` is kept.
+    /// LLM-type modes still fall back to raw unless the local LLM is enabled.
+    fn effective_mode_key(&mut self) -> String {
+        if self.cfg.auto_mode {
+            if let Some((exe, title)) = platform::foreground_app() {
+                self.last_window = Some((exe.clone(), title.clone()));
+                if let Some(st) = self.settings.as_mut() {
+                    st.last_window = Some((exe.clone(), title.clone()));
+                }
+                let matched = settings_logic::match_app_mode(&self.cfg.app_modes, &exe, &title);
+                // The window title is user content (document names, email
+                // subjects) and stays out of the logs; it is shown in the
+                // auto-mode settings card, which is where it is needed.
+                eprintln!(
+                    "[auto-mode] exe={exe:?} -> {}",
+                    matched.map(|s| s.as_str()).unwrap_or("(no rule)")
+                );
+                if let Some(key) = matched {
+                    if self.cfg.modes.contains_key(key) {
+                        return key.clone();
+                    }
+                    eprintln!("[auto-mode] unknown mode {key:?}, ignored");
+                }
+            }
+        }
+        self.cfg.active_mode.clone()
+    }
+
     /// Ends positioning: stores the window's current position.
     fn finish_positioning(&mut self, ctx: &egui::Context) {
         if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
@@ -318,6 +410,8 @@ impl App {
     fn start_recording(&mut self, ctx: &egui::Context) {
         // No new session while the previous streaming worker is still
         // alive (otherwise two workers share the transcriber and pasting).
+        // Checked before anything is written to `self`: a refused take must
+        // leave the previous one's mode and id untouched.
         if let Some(h) = self.stream_join.take() {
             if h.is_finished() {
                 let _ = h.join();
@@ -327,22 +421,30 @@ impl App {
                 return;
             }
         }
+        // Resolve the take's mode now, while the target application still has
+        // focus (auto-mode reads the foreground app before the dock appears).
+        let take_mode = self.effective_mode_key();
         self.recorder = Recorder::new(self.cfg.input_device.clone(), self.cfg.audio_source.clone());
         match self.recorder.start() {
             Ok(()) => {
+                self.take_mode = take_mode;
+                self.take_id = self.take_id.wrapping_add(1);
+                // Escape held right now belongs to the app that had focus, not
+                // to this take: it must be released before it can abort.
+                self.cancel_gesture = platform::CancelGesture::new(platform::escape_down());
                 // Continuous mode: transcription/insertion as pauses occur
                 // (only for raw-type modes, like the v1).
                 let mode_is_raw = self
                     .cfg
                     .modes
-                    .get(&self.cfg.active_mode)
+                    .get(&self.take_mode)
                     .map(|m| m.kind == "raw")
                     .unwrap_or(true);
                 if self.cfg.streaming && mode_is_raw {
                     let lang = self
                         .cfg
                         .modes
-                        .get(&self.cfg.active_mode)
+                        .get(&self.take_mode)
                         .and_then(|m| m.language.clone())
                         .or_else(|| self.cfg.language.clone());
                     let params = StreamParams {
@@ -351,25 +453,32 @@ impl App {
                         language: lang,
                         vocab_prompt: modes::build_initial_prompt(&self.cfg.vocabulary, ""),
                         beam_size: self.cfg.beam_size,
+                        low_voice: self.cfg.low_voice,
                     };
                     let auto_paste = self.cfg.auto_paste;
                     let restore_delay = self.cfg.paste_restore_delay;
                     let emit = move |s: &str| {
                         if auto_paste {
                             if let Err(e) = paste::paste_text_with_delay(s, restore_delay) {
-                                eprintln!("collage (stream): {e}");
+                                eprintln!("paste (stream): {e}");
                             }
                         }
                     };
                     let tx = self.tx.clone();
                     let ctx2 = ctx.clone();
+                    // Captured now: by the time the worker reports back, the
+                    // application may already be on another take.
+                    let id = self.take_id;
+                    let take_mode = self.take_mode.clone();
                     let done = move |res: Result<String, String>| {
                         let _ = match res {
                             Ok(text) => tx.send(Worker::Ok {
+                                id,
                                 text,
                                 status: "stream",
+                                mode: take_mode,
                             }),
-                            Err(e) => tx.send(Worker::Err(e)),
+                            Err(e) => tx.send(Worker::Err(id, e)),
                         };
                         ctx2.request_repaint();
                     };
@@ -388,10 +497,10 @@ impl App {
                     since: Instant::now(),
                 };
                 self.show_dock(ctx, true);
-                eprintln!("[etat] enregistrement demarre");
+                eprintln!("[state] recording started");
             }
             Err(e) => {
-                eprintln!("micro: {e}");
+                eprintln!("mic: {e}");
                 self.flash(ctx, DockState::Error, tr("status_mic_ko"), 1.6);
             }
         }
@@ -401,40 +510,50 @@ impl App {
         // Streaming session: the worker transcribes the remainder then signals completion.
         if let Some(session) = self.stream.take() {
             let tail = self.recorder.stop();
-            eprintln!("[etat] arret streaming ({} echantillons restants)", tail.len());
+            eprintln!("[state] streaming stopped ({} samples left)", tail.len());
             self.stream_join = Some(session.finish(tail));
             self.dock.state = DockState::Transcribing;
             self.dock.status_text = "\u{2026}".into();
             self.state = State::Transcribing;
             return;
         }
-        let audio = self.recorder.stop();
+        let mut audio = self.recorder.stop();
         eprintln!(
-            "[etat] arret -> transcription ({} echantillons, {:.2}s)",
+            "[state] stopped -> transcribing ({} samples, {:.2}s)",
             audio.len(),
             audio.len() as f32 / 16000.0
         );
+        // Soft-voice dictation: amplify a quiet take before transcription.
+        if self.cfg.low_voice {
+            dictata::audio::boost_quiet(&mut audio);
+        }
         self.dock.state = DockState::Transcribing;
         self.dock.status_text = "\u{2026}".into();
         self.state = State::Transcribing;
 
         let cfg = self.cfg.clone();
+        let take_key = self.take_mode.clone();
         let mode = cfg
             .modes
-            .get(&cfg.active_mode)
+            .get(&take_key)
             .cloned()
-            .unwrap_or_else(|| cfg.modes.values().next().cloned().expect("au moins un mode"));
+            .unwrap_or_else(|| cfg.modes.values().next().cloned().expect("at least one mode"));
         let model_path = model_file_path(&cfg);
         let gpu = cfg.gpu != "cpu";
         let tr = self.transcriber.clone();
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
+        // Captured now: the result is handled frames later, possibly after a
+        // new take has already replaced `take_mode`.
+        let id = self.take_id;
 
         std::thread::spawn(move || {
             if audio.len() < 4000 {
                 let _ = tx.send(Worker::Ok {
+                    id,
                     text: String::new(),
                     status: "raw",
+                    mode: take_key,
                 });
                 ctx2.request_repaint();
                 return;
@@ -456,7 +575,7 @@ impl App {
                 match Transcriber::load(&model_path, gpu) {
                     Ok(t) => *guard = Some(t),
                     Err(e) => {
-                        let _ = tx.send(Worker::Err(e));
+                        let _ = tx.send(Worker::Err(id, e));
                         ctx2.request_repaint();
                         return;
                     }
@@ -473,15 +592,24 @@ impl App {
             };
             match t.transcribe(&audio, lang.as_deref(), translate, prompt_opt, cfg.beam_size, vad_path.as_deref()) {
                 Ok(raw) => {
-                    let (text, status) = modes::apply_mode(&raw, &mode, &cfg);
+                    // Whisper's own detection, so the LLM is told which
+                    // language to answer in even when `language` is "auto".
+                    let detected = t.detected_language();
+                    eprintln!("[transcribe] detected language = {detected:?}");
+                    let (text, status) = modes::apply_mode(&raw, &mode, &cfg, detected);
                     if !text.trim().is_empty() {
                         let dur = audio.len() as f64 / 16000.0;
-                        history::add_entry(&text, &cfg.active_mode, lang.as_deref(), Some(dur));
+                        history::add_entry(&cfg, &text, &take_key, lang.as_deref(), Some(dur));
                     }
-                    let _ = tx.send(Worker::Ok { text, status });
+                    let _ = tx.send(Worker::Ok {
+                        id,
+                        text,
+                        status,
+                        mode: take_key,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(Worker::Err(e));
+                    let _ = tx.send(Worker::Err(id, e));
                 }
             }
             ctx2.request_repaint();
@@ -490,14 +618,34 @@ impl App {
 
     fn handle_worker(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
+            // Drop the one result owed by a cancelled take, matched on its id so
+            // an unrelated result still in flight is never discarded instead.
+            let id = match &msg {
+                Worker::Ok { id, .. } | Worker::Err(id, _) => *id,
+            };
+            if self.cancelled_take == Some(id) {
+                self.cancelled_take = None;
+                eprintln!("[worker] take {id} result dropped (cancelled)");
+                continue;
+            }
             match msg {
-                Worker::Ok { text, status } => {
-                    eprintln!("[worker] statut={status}, texte={text:?}");
+                Worker::Ok {
+                    id,
+                    text,
+                    status,
+                    mode,
+                } => {
+                    // Metadata only: the transcription itself is user content
+                    // and must never reach a log.
+                    eprintln!(
+                        "[worker] take {id} status={status} mode={mode} chars={}",
+                        text.chars().count()
+                    );
                     if text.trim().is_empty() {
                         self.flash(ctx, DockState::Done, tr("status_empty"), 0.9);
                     } else if status == "stream" {
                         // Already pasted chunk by chunk: just history + flash.
-                        history::add_entry(&text, &self.cfg.active_mode, None, None);
+                        history::add_entry(&self.cfg, &text, &mode, None, None);
                         self.flash(ctx, DockState::Done, tr("status_pasted"), 0.9);
                     } else {
                         let mut paste_failed = false;
@@ -505,7 +653,7 @@ impl App {
                             if let Err(e) =
                                 paste::paste_text_with_delay(&text, self.cfg.paste_restore_delay)
                             {
-                                eprintln!("collage: {e}");
+                                eprintln!("paste: {e}");
                                 paste_failed = true;
                             }
                         }
@@ -523,8 +671,8 @@ impl App {
                         self.flash(ctx, DockState::Done, label, 0.9);
                     }
                 }
-                Worker::Err(e) => {
-                    eprintln!("transcription: {e}");
+                Worker::Err(id, e) => {
+                    eprintln!("[worker] take {id} transcription failed: {e}");
                     self.flash(ctx, DockState::Error, tr("status_error"), 1.6);
                 }
             }
@@ -540,6 +688,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let t = ctx.input(|i| i.time);
+
+        // Startup notice, from the second frame onwards: on the first one the
+        // dock is still being hidden, and showing it in the same frame would
+        // race that viewport command.
+        if self.no_activate_done
+            && let Some(msg) = self.startup_notice.take()
+        {
+            self.flash(&ctx, DockState::Error, msg, 3.0);
+        }
 
         // No-focus-steal applied once (the HWND exists even when hidden).
         if !self.no_activate_done {
@@ -589,7 +746,9 @@ impl eframe::App for App {
                 }
                 TrayAction::OpenSettings => {
                     if self.settings.is_none() {
-                        self.settings = Some(SettingsState::new(self.cfg.clone()));
+                        let mut st = SettingsState::new(self.cfg.clone());
+                        st.last_window = self.last_window.clone();
+                        self.settings = Some(st);
                     }
                 }
                 TrayAction::Quit => {
@@ -608,9 +767,23 @@ impl eframe::App for App {
                 self.dock.push_level(lvl);
                 let secs = since.elapsed().as_secs();
                 self.dock.status_text = format!("{}:{:02}", secs / 60, secs % 60);
-                // Recording duration cap (bounds memory usage).
-                if secs >= self.cfg.max_record_seconds as u64 {
-                    eprintln!("[etat] duree max atteinte -> arret");
+                // A capture stream that died (device unplugged, permission
+                // revoked) must not leave the user dictating into nothing.
+                if self.recorder.stream_failed() {
+                    self.abort_take(&ctx, "audio stream lost", tr("status_mic_lost"), 1.6);
+                }
+                // Escape aborts the take. Polled here rather than through egui
+                // input: the dock never holds focus, so it never sees the key
+                // itself. A hold is required, because the key is read globally
+                // and a tap usually belongs to the focused application.
+                else if self
+                    .cancel_gesture
+                    .poll(platform::escape_down(), Instant::now())
+                {
+                    self.cancel_recording(&ctx);
+                } else if secs >= self.cfg.max_record_seconds as u64 {
+                    // Recording duration cap (bounds memory usage).
+                    eprintln!("[state] max duration reached -> stopping");
                     self.stop_and_transcribe(&ctx);
                 }
                 true
@@ -674,10 +847,24 @@ fn main() -> eframe::Result {
     // without a configured logger) instead of polluting stderr.
     whisper_rs::install_logging_hooks();
 
-    let cfg = config::load();
+    let mut cfg = config::load();
     i18n::set_lang(&cfg.ui_lang);
+
+    // A marker left behind means the previous run died loading that model
+    // (whisper.cpp aborts on a malformed ggml file). Keeping the model selected
+    // would crash again on the next take, with no console to explain it, so
+    // fall back to the default. The model file itself is left alone.
+    let sentinel = std::fs::read_to_string(config::model_sentinel_path()).ok();
+    let recovered = config::recover_from_sentinel(sentinel.as_deref(), &cfg.model);
+    if let Some(faulty) = &recovered {
+        eprintln!("[startup] previous run died loading {faulty}; falling back to the default model");
+        cfg.model = config::default_model();
+        config::save(&cfg);
+    }
+    let _ = std::fs::remove_file(config::model_sentinel_path());
+
     eprintln!(
-        "Dictata — modele={}, hotkey={}, mode={}",
+        "Dictata — model={}, hotkey={}, mode={}",
         cfg.model, cfg.hotkey, cfg.active_mode
     );
 
@@ -698,6 +885,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Dictata",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(cfg)))),
+        Box::new(move |_cc| {
+            let mut app = App::new(cfg);
+            if recovered.is_some() {
+                app.startup_notice = Some(tr("status_model_recovered"));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }

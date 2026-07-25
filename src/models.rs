@@ -57,6 +57,32 @@ pub fn is_installed(model_dir: &str, model: &str) -> bool {
     model_path(model_dir, model).exists()
 }
 
+/// Raw `.bin` file names present in `model_dir`.
+///
+/// Lets a caller read the directory once and answer many "is this installed?"
+/// questions from the result, instead of one `exists()` syscall per model per
+/// UI frame. Returns an empty list if the directory cannot be read, which
+/// [`is_installed_among`] then reports as "not installed" — same answer as
+/// [`is_installed`] in that situation.
+pub fn installed_files(model_dir: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(model_dir) {
+        for e in rd.flatten() {
+            if let Some(n) = e.file_name().to_str()
+                && n.ends_with(".bin")
+            {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// [`is_installed`] answered from a list obtained via [`installed_files`].
+pub fn is_installed_among(files: &[String], model: &str) -> bool {
+    files.contains(&file_name(model))
+}
+
 /// Delete an installed model file.
 pub fn delete(model_dir: &str, model: &str) -> Result<(), String> {
     std::fs::remove_file(model_path(model_dir, model)).map_err(|e| e.to_string())
@@ -64,26 +90,33 @@ pub fn delete(model_dir: &str, model: &str) -> Result<(), String> {
 
 /// List the ggml models present in `model_dir` (names without `ggml-`/`.bin`).
 pub fn list_installed(model_dir: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(model_dir) {
-        for e in rd.flatten() {
-            if let Some(n) = e.file_name().to_str() {
-                // VAD models (`ggml-silero-*.bin`) are not transcription models:
-                // selecting one as the main model crashes whisper.cpp. Hide them.
-                if n.starts_with("ggml-silero-") {
-                    continue;
-                }
-                if let Some(s) = n.strip_prefix("ggml-").and_then(|s| s.strip_suffix(".bin")) {
-                    out.push(s.to_string());
-                } else if n.ends_with(".bin") {
-                    // Custom model: identified by its full file name.
-                    out.push(n.to_string());
-                }
-            }
-        }
-    }
+    list_installed_from(&installed_files(model_dir))
+}
+
+/// [`list_installed`] from a listing already obtained via [`installed_files`].
+pub fn list_installed_from(files: &[String]) -> Vec<String> {
+    let mut out = model_names(files);
     out.sort();
     out
+}
+
+/// File names -> model identifiers, as `config.model` stores them.
+fn model_names(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|n| {
+            // VAD models (`ggml-silero-*.bin`) are not transcription models:
+            // selecting one as the main model crashes whisper.cpp. Hide them.
+            !n.starts_with("ggml-silero-")
+        })
+        .map(|n| {
+            match n.strip_prefix("ggml-").and_then(|s| s.strip_suffix(".bin")) {
+                Some(s) => s.to_string(),
+                // Custom model: identified by its full file name.
+                None => n.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// Download `model` into `model_dir`. `progress(received, total_opt)` is called
@@ -118,20 +151,72 @@ pub fn download_vad(
     download_url(model_dir, VAD_MODEL_URL, VAD_MODEL_FILE, progress)
 }
 
+/// Last path component of `fname`, rejecting anything that cannot name a file
+/// inside a directory (traversal, empty, separator only).
+///
+/// `download_url` is the single point where a download touches the disk, so the
+/// check lives there rather than only in the callers: `download` already goes
+/// through [`file_name`], but the HuggingFace `FileUrl` path derives its name
+/// straight from the URL and would otherwise reach `Path::join` unfiltered.
+fn safe_file_name(fname: &str) -> Result<&str, String> {
+    Path::new(fname)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| format!("nom de fichier invalide: {fname:?}"))
+}
+
+/// Inactivity tolerated on the transfer before it is declared dead.
+///
+/// This is the blocking client's own default, pinned explicitly because the
+/// download depends on it: in `reqwest::blocking` this timeout is applied to
+/// *each* read of the body with a fresh deadline (see `blocking/response.rs`,
+/// `Read for Response`), so it acts as an inactivity timeout and a multi-GB
+/// model on a slow link still completes as long as bytes keep arriving. Do not
+/// mistake it for the async client's `timeout`, which is a total deadline and
+/// would cut large downloads short.
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Not covered by the default above, which only starts once a connection exists.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Download an arbitrary URL into `model_dir` under `fname` (same `.part`
 /// then rename scheme as `download`).
 pub fn download_url(
     model_dir: &str,
     url: &str,
     fname: &str,
-    mut progress: impl FnMut(u64, Option<u64>),
+    progress: impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
+    download_url_with_timeouts(
+        model_dir,
+        url,
+        fname,
+        progress,
+        DOWNLOAD_READ_TIMEOUT,
+        DOWNLOAD_CONNECT_TIMEOUT,
+    )
+}
+
+/// [`download_url`] with explicit timeouts, so the stalled-transfer test does
+/// not have to wait the production 30 s.
+fn download_url_with_timeouts(
+    model_dir: &str,
+    url: &str,
+    fname: &str,
+    mut progress: impl FnMut(u64, Option<u64>),
+    read_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> Result<PathBuf, String> {
+    let fname = safe_file_name(fname)?;
     std::fs::create_dir_all(model_dir).map_err(|e| format!("models directory: {e}"))?;
     let dest = Path::new(model_dir).join(fname);
     let tmp = dest.with_extension("part");
 
-    // Default blocking client: no timeout (large downloads).
-    let mut resp = reqwest::blocking::Client::new()
+    let mut resp = reqwest::blocking::Client::builder()
+        .timeout(read_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(|e| format!("client http: {e}"))?
         .get(url)
         .send()
         .map_err(|e| format!("request: {e}"))?;
@@ -351,6 +436,99 @@ mod tests {
             let p = model_path("F:\\models", m);
             assert_eq!(p.parent(), Some(Path::new("F:\\models")), "escaped: {m}");
         }
+    }
+
+    #[test]
+    fn installed_lookup_matches_the_per_file_check() {
+        // The cached lookup must answer exactly like `is_installed`, including
+        // for custom models stored under their full file name.
+        let files = vec![
+            "ggml-base.bin".to_string(),
+            "whisper-large-zh.bin".to_string(),
+            VAD_MODEL_FILE.to_string(),
+        ];
+        assert!(is_installed_among(&files, "base"));
+        assert!(is_installed_among(&files, "whisper-large-zh.bin"));
+        assert!(is_installed_among(&files, VAD_MODEL_FILE));
+        assert!(!is_installed_among(&files, "small"));
+        assert!(!is_installed_among(&files, "ggml-base.bin.bak"));
+        // A traversing name resolves to its leaf, like everywhere else.
+        assert!(is_installed_among(&files, "../../ggml-base.bin"));
+
+        // And the display list hides the VAD model while keeping the rest.
+        let mut names = model_names(&files);
+        names.sort();
+        assert_eq!(names, vec!["base".to_string(), "whisper-large-zh.bin".to_string()]);
+    }
+
+    #[test]
+    fn download_url_gives_up_on_stalled_stream() {
+        // Server that answers the headers then goes silent without closing: the
+        // read blocks forever without a read timeout, wedging the models UI
+        // until the app is restarted.
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = srv.local_addr().unwrap().port();
+        let keep_alive = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = srv.accept() {
+                let mut junk = [0u8; 1024];
+                let _ = s.read(&mut junk);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789");
+                let _ = s.flush();
+                // Hold the connection open, sending nothing more, well past the
+                // 300 ms read timeout the download is given below.
+                std::thread::sleep(std::time::Duration::from_millis(900));
+            }
+        });
+        let dir = std::env::temp_dir().join("dictata_stall_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let started = std::time::Instant::now();
+        let res = download_url_with_timeouts(
+            dir.to_str().unwrap(),
+            &format!("http://127.0.0.1:{port}/x.bin"),
+            "x.bin",
+            |_, _| {},
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(5),
+        );
+        let err = res.expect_err("un transfert gele doit echouer");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "le timeout de lecture n'a pas coupe le transfert: {err}"
+        );
+        assert!(!dir.join("x.bin").exists(), "fichier incomplet installe: {err}");
+        assert!(!dir.join("x.part").exists(), "reste un .part: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = keep_alive.join();
+    }
+
+    #[test]
+    fn download_rejects_unsafe_file_names() {
+        // Traversal is stripped down to the leaf, which stays inside model_dir.
+        assert_eq!(safe_file_name("../../evil.bin").unwrap(), "evil.bin");
+        assert_eq!(safe_file_name("..\\..\\evil.bin").unwrap(), "evil.bin");
+        assert_eq!(safe_file_name("C:\\Windows\\System32\\evil.bin").unwrap(), "evil.bin");
+        assert_eq!(safe_file_name("/etc/passwd.bin").unwrap(), "passwd.bin");
+        // Legitimate names are untouched (the other callers rely on this).
+        assert_eq!(safe_file_name("ggml-base.bin").unwrap(), "ggml-base.bin");
+        assert_eq!(safe_file_name(VAD_MODEL_FILE).unwrap(), VAD_MODEL_FILE);
+        // A trailing separator is normalised away, and the leaf still stays put.
+        assert_eq!(safe_file_name("some/dir/").unwrap(), "dir");
+        // Names that cannot designate a file are refused outright.
+        for bad in ["", "..", ".", "/", "\\", "../"] {
+            assert!(safe_file_name(bad).is_err(), "accepte a tort: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn download_url_refuses_unsafe_name_before_any_request() {
+        // Port 1 is closed: reaching the network would surface a request error,
+        // so a "nom de fichier invalide" proves the check runs first.
+        let dir = std::env::temp_dir().join("dictata_unsafe_name_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = download_url(dir.to_str().unwrap(), "http://127.0.0.1:1/x", "..", |_, _| {})
+            .expect_err("un nom invalide doit etre refuse");
+        assert!(err.contains("nom de fichier invalide"), "erreur inattendue: {err}");
+        assert!(!dir.exists(), "le dossier ne doit pas etre cree avant la validation");
     }
 
     #[test]

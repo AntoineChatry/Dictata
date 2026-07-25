@@ -22,8 +22,33 @@ pub struct Entry {
     pub text: String,
 }
 
-/// Append an entry to the end of the history file.
-pub fn add_entry(text: &str, mode: &str, language: Option<&str>, duration: Option<f64>) {
+/// Extra entries tolerated above `history_limit` before the file is rewritten.
+///
+/// Trimming reads and rewrites the whole file, and two of the three callers run
+/// on the UI thread, so it must not happen on every dictation. With this slack
+/// it happens once per `RETENTION_SLACK` entries instead.
+///
+/// The cap is therefore a high-water mark, not an exact count: the file cycles
+/// between `history_limit` and `history_limit + RETENTION_SLACK` entries.
+const RETENTION_SLACK: usize = 100;
+
+/// Append an entry to the end of the history file, unless the user turned the
+/// history off. Applies the retention cap afterwards.
+pub fn add_entry(
+    cfg: &config::Config,
+    text: &str,
+    mode: &str,
+    language: Option<&str>,
+    duration: Option<f64>,
+) {
+    if !cfg.save_history {
+        return;
+    }
+    append_entry(text, mode, language, duration);
+    enforce_retention(cfg.history_limit);
+}
+
+fn append_entry(text: &str, mode: &str, language: Option<&str>, duration: Option<f64>) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -54,6 +79,30 @@ pub fn add_entry(text: &str, mode: &str, language: Option<&str>, duration: Optio
             }
         }
         Err(e) => eprintln!("ouverture historique impossible ({e})"),
+    }
+}
+
+/// Drops the oldest entries so the file holds at most `limit` of them.
+///
+/// Only rewrites once the file exceeds `limit + RETENTION_SLACK`, and writes
+/// through a temp file then renames, so an interrupted trim cannot truncate the
+/// history.
+fn enforce_retention(limit: usize) {
+    let limit = limit.max(1);
+    let path = config::history_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= limit + RETENTION_SLACK {
+        return;
+    }
+    let kept = lines[lines.len() - limit..].join("\n");
+    let tmp = path.with_extension("jsonl.tmp");
+    let res = std::fs::write(&tmp, format!("{kept}\n")).and_then(|_| std::fs::rename(&tmp, &path));
+    if let Err(e) = res {
+        eprintln!("rotation historique impossible ({e})");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -132,16 +181,30 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_and_order() {
-        // Isolate the history file in a temporary directory.
-        let dir = std::env::temp_dir().join(format!("fwhist_{}", std::process::id()));
+    /// Points `DICTATA_HOME` at a private directory for the duration of a test.
+    ///
+    /// The history tests share one process-wide env var, so they must not run
+    /// concurrently; they are kept in a single `#[test]` each with a distinct
+    /// directory and are serialised by `HISTORY_ENV` below.
+    fn use_temp_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fwhist_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("DICTATA_HOME", &dir) };
+        dir
+    }
+
+    static HISTORY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn roundtrip_and_order() {
+        let _lock = HISTORY_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = use_temp_home("roundtrip");
+        let cfg = config::Config::default();
         clear();
 
-        add_entry("premier", "raw", Some("fr"), Some(1.234));
-        add_entry("deuxieme", "email", None, None);
+        add_entry(&cfg, "premier", "raw", Some("fr"), Some(1.234));
+        add_entry(&cfg, "deuxieme", "email", None, None);
         let entries = read_entries(50);
         assert_eq!(entries.len(), 2);
         // most recent first
@@ -154,6 +217,70 @@ mod tests {
 
         clear();
         assert!(read_entries(50).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_history_writes_nothing() {
+        let _lock = HISTORY_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = use_temp_home("disabled");
+        let cfg = config::Config {
+            save_history: false,
+            ..config::Config::default()
+        };
+        clear();
+
+        add_entry(&cfg, "ne doit pas etre ecrit", "raw", None, None);
+        assert!(
+            !config::history_path().exists(),
+            "le fichier ne doit meme pas etre cree"
+        );
+        assert!(read_entries(50).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_drops_the_oldest_entries() {
+        let _lock = HISTORY_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = use_temp_home("retention");
+        let cfg = config::Config { history_limit: 5, ..config::Config::default() };
+        clear();
+
+        // The trim fires once past limit + RETENTION_SLACK and cuts back to the
+        // limit, so the file cycles between the two bounds rather than sitting
+        // exactly on the limit.
+        let total = 5 + RETENTION_SLACK + 3;
+        for i in 0..total {
+            add_entry(&cfg, &format!("entree {i}"), "raw", None, None);
+        }
+        let entries = read_entries(10_000);
+        assert!(
+            entries.len() <= 5 + RETENTION_SLACK,
+            "la borne haute doit etre respectee: {}",
+            entries.len()
+        );
+        // read_entries returns most recent first: the newest survived...
+        assert_eq!(entries[0].text, format!("entree {}", total - 1));
+        // ...and the oldest were dropped.
+        assert!(
+            !entries.iter().any(|e| e.text == "entree 0"),
+            "la plus ancienne entree aurait du etre supprimee"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_entries_below_the_slack() {
+        let _lock = HISTORY_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = use_temp_home("slack");
+        let cfg = config::Config { history_limit: 5, ..config::Config::default() };
+        clear();
+
+        // Just above the limit but within the slack: nothing is rewritten yet.
+        for i in 0..8 {
+            add_entry(&cfg, &format!("entree {i}"), "raw", None, None);
+        }
+        assert_eq!(read_entries(1000).len(), 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

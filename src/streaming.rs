@@ -28,6 +28,9 @@ const POLL_MS: u64 = 200; // buffer drain cadence
 const SILENCE_RMS: f32 = 0.008; // below this RMS, a 100 ms block counts as silence
 const PAUSE_S: f32 = 0.7; // trailing silence that triggers a cut
 const MIN_VOICED_S: f32 = 0.6; // minimum voiced audio in a chunk (anti-hallucination)
+// Lower bar used when there is no choice but to decide now: the end of the take,
+// and the forced cut at MAX_CHUNK_S. Below it, the audio is treated as noise.
+const MIN_TAIL_VOICED_S: f32 = 0.3;
 const MAX_CHUNK_S: f32 = 15.0; // forced cut even without a pause
 const PROMPT_TAIL: usize = 200; // chars of already-emitted text re-injected as prompt
 
@@ -38,6 +41,10 @@ pub struct StreamParams {
     pub language: Option<String>,
     pub vocab_prompt: String,
     pub beam_size: i32,
+    /// Amplify quiet chunks before transcription (`low_voice` in the config).
+    /// The one-shot path has always honoured this setting; streaming did not,
+    /// which made it noticeably worse on a soft microphone.
+    pub low_voice: bool,
 }
 
 /// Streaming session: application-side handle.
@@ -46,6 +53,7 @@ pub struct StreamParams {
 /// worker for each non-empty chunk; `done` receives the full text at the end.
 pub struct StreamingSession {
     stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     tail_tx: Sender<Vec<f32>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -61,18 +69,21 @@ impl StreamingSession {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = cancel.clone();
         let (tail_tx, tail_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             // `done` must be called even if `run` panics, otherwise
             // the application stays stuck in the "Transcription…" state.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(drain, transcriber, params, &emit, stop2, tail_rx)
+                run(drain, transcriber, params, &emit, stop2, cancel2, tail_rx)
             }))
-            .unwrap_or_else(|_| Err("panique du worker streaming".into()));
+            .unwrap_or_else(|_| Err("streaming worker panicked".into()));
             done(result);
         });
         StreamingSession {
             stop,
+            cancel,
             tail_tx,
             handle: Some(handle),
         }
@@ -87,25 +98,113 @@ impl StreamingSession {
     pub fn finish(mut self, tail: Vec<f32>) -> std::thread::JoinHandle<()> {
         let _ = self.tail_tx.send(tail);
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.take().expect("finish() consomme la session, le handle est present")
+        self.handle.take().expect("finish() consumes the session, the handle is present")
+    }
+
+    /// Aborts the session: the worker stops without transcribing or emitting
+    /// the remaining audio. Chunks already emitted have already been pasted
+    /// into the target application and cannot be taken back.
+    #[must_use]
+    pub fn cancel(mut self) -> std::thread::JoinHandle<()> {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.tail_tx.send(Vec::new());
+        self.handle.take().expect("cancel() consumes the session, the handle is present")
     }
 }
 
-/// Trailing silence (s): 100 ms blocks below SILENCE_RMS from the end of the buffer.
-fn trailing_silence(buf: &[f32]) -> f32 {
-    let block = SAMPLE_RATE / 10; // 100 ms
-    let mut silence = 0.0f32;
-    let mut end = buf.len();
-    while end >= block {
-        let start = end - block;
-        let rms = (buf[start..end].iter().map(|s| s * s).sum::<f32>() / block as f32).sqrt();
-        if rms >= SILENCE_RMS {
-            break;
+const BLOCK_SAMPLES: usize = SAMPLE_RATE / 10; // 100 ms
+const BLOCK_S: f32 = 0.1;
+
+/// Rolling measure of a streaming buffer: how much voiced audio it holds and
+/// how much silence currently trails it.
+///
+/// Fed only with the samples newly drained from the capture, so the cost of a
+/// poll is proportional to the new audio and not to the buffer already
+/// accumulated. The previous implementation rescanned the whole buffer every
+/// 200 ms and never stopped early on an all-silent one, which made a long pause
+/// quadratic: five minutes of silence meant re-reading 4.8 M samples five times
+/// a second.
+///
+/// [`SpeechMeter::voiced_s`] measures the *span* of speech — from the first
+/// block above `SILENCE_RMS` to the last one — not the sum of the loud blocks.
+///
+/// This distinction caused a regression worth recording. Summing only the loud
+/// blocks looks stricter and more honest, but `MIN_VOICED_S` was calibrated
+/// against the span: under the old `duration - trailing_silence` formula a
+/// single loud block ending 0.6 s into the chunk cleared the gate, whereas
+/// summing demands six of them. Ordinary speech is full of sub-threshold gaps
+/// between words, so short utterances stopped triggering a flush entirely and
+/// the take came back empty. Measuring the span keeps the constant meaning what
+/// it meant when it was tuned, while still reporting exactly `0.0` on a buffer
+/// that never crossed the threshold — the property the incremental rewrite was
+/// introduced to guarantee. Leading silence, which the old formula wrongly
+/// counted as speech, is excluded.
+struct SpeechMeter {
+    /// Audio accumulated since the first voiced block; `None` until one is seen.
+    since_first_voiced_s: Option<f32>,
+    trailing_silence_s: f32,
+    /// Samples left over from the last push (less than one 100 ms block).
+    pending: Vec<f32>,
+    #[cfg(test)]
+    blocks_analysed: usize,
+}
+
+impl SpeechMeter {
+    fn new() -> Self {
+        SpeechMeter {
+            since_first_voiced_s: None,
+            trailing_silence_s: 0.0,
+            pending: Vec::with_capacity(BLOCK_SAMPLES),
+            #[cfg(test)]
+            blocks_analysed: 0,
         }
-        silence += 0.1;
-        end = start;
     }
-    silence
+
+    /// Seconds of speech-bearing audio: the span between the first and the last
+    /// voiced block. Exactly `0.0` when no block ever crossed `SILENCE_RMS`.
+    fn voiced_s(&self) -> f32 {
+        match self.since_first_voiced_s {
+            None => 0.0,
+            Some(span) => (span - self.trailing_silence_s).max(0.0),
+        }
+    }
+
+    /// Accounts for `new` samples, consuming them one full 100 ms block at a
+    /// time. A partial block is kept for the next call, so the result does not
+    /// depend on how the audio was split across polls.
+    fn push(&mut self, new: &[f32]) {
+        self.pending.extend_from_slice(new);
+        let mut consumed = 0;
+        while consumed + BLOCK_SAMPLES <= self.pending.len() {
+            let block = &self.pending[consumed..consumed + BLOCK_SAMPLES];
+            let rms = (block.iter().map(|s| s * s).sum::<f32>() / BLOCK_SAMPLES as f32).sqrt();
+            if rms >= SILENCE_RMS {
+                // First voiced block opens the span; the rest extends it.
+                *self.since_first_voiced_s.get_or_insert(0.0) += BLOCK_S;
+                self.trailing_silence_s = 0.0;
+            } else {
+                // Silence before any speech is not part of the span at all.
+                if let Some(span) = self.since_first_voiced_s.as_mut() {
+                    *span += BLOCK_S;
+                }
+                self.trailing_silence_s += BLOCK_S;
+            }
+            consumed += BLOCK_SAMPLES;
+            #[cfg(test)]
+            {
+                self.blocks_analysed += 1;
+            }
+        }
+        self.pending.drain(..consumed);
+    }
+
+    /// Call whenever the buffer it measures is emptied or truncated.
+    fn reset(&mut self) {
+        self.since_first_voiced_s = None;
+        self.trailing_silence_s = 0.0;
+        self.pending.clear();
+    }
 }
 
 fn run(
@@ -114,6 +213,7 @@ fn run(
     params: StreamParams,
     emit: &(impl Fn(&str) + Send),
     stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     tail_rx: Receiver<Vec<f32>>,
 ) -> Result<String, String> {
     let mut buf: Vec<f32> = Vec::new();
@@ -123,8 +223,17 @@ fn run(
     // chunks during hesitations/pauses).
     let mut last_norm = String::new();
 
+    let cancelled = &cancel;
     let flush = |buf: &mut Vec<f32>, text: &mut String, last_norm: &mut String| -> Result<(), String> {
-        let chunk = std::mem::take(buf);
+        let mut chunk = std::mem::take(buf);
+        // Applied to the whole chunk, never per poll: `boost_quiet` is a peak
+        // normaliser, so running it on each 200 ms slice would give every slice
+        // its own gain — a staircase of amplification that lifts the noise
+        // floor between words. One gain per utterance, exactly as the one-shot
+        // path does after `recorder.stop()`.
+        if params.low_voice {
+            crate::audio::boost_quiet(&mut chunk);
+        }
         // Acquire the lock even if poisoned (another thread panicked):
         // an Option<Transcriber> stays coherent, at worst we reload it.
         let mut guard = transcriber.lock().unwrap_or_else(|p| p.into_inner());
@@ -152,33 +261,69 @@ fn run(
             return Ok(());
         }
         *last_norm = norm;
+        // Cancelled while this chunk was being transcribed: drop it instead
+        // of pasting into an app the user already backed out of.
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let out = if text.is_empty() { piece } else { format!(" {piece}") };
         text.push_str(&out);
         emit(&out);
         Ok(())
     };
 
+    let mut meter = SpeechMeter::new();
+
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(POLL_MS));
-        buf.extend(drain.drain());
-        let silence = trailing_silence(&buf);
-        let voiced = buf.len() as f32 / SAMPLE_RATE as f32 - silence;
-        if voiced < MIN_VOICED_S {
+        let new = drain.drain();
+        meter.push(&new);
+        buf.extend(new);
+        let buffered_s = buf.len() as f32 / SAMPLE_RATE as f32;
+        let voiced_s = meter.voiced_s();
+
+        // Forced cut: the buffer cannot be allowed to grow without end.
+        if buffered_s >= MAX_CHUNK_S {
+            if voiced_s >= MIN_TAIL_VOICED_S {
+                // There is speech in there. Transcribe it — never discard it,
+                // whatever `MIN_VOICED_S` would have said about a pause cut.
+                if let Err(e) = flush(&mut buf, &mut text, &mut last_norm) {
+                    eprintln!("[streaming] chunk: {e}");
+                }
+                meter.reset();
+            } else {
+                // Fifteen seconds that never crossed the threshold: room noise.
+                // Drop it rather than carry it to the end of the take, keeping
+                // the last second in case a word has only just started.
+                let keep = SAMPLE_RATE.min(buf.len());
+                buf.drain(..buf.len() - keep);
+                meter.reset();
+                meter.push(&buf);
+            }
             continue;
         }
-        if silence >= PAUSE_S || buf.len() as f32 / SAMPLE_RATE as f32 >= MAX_CHUNK_S {
+
+        // Normal cut, on a pause long enough to end a sentence.
+        if voiced_s >= MIN_VOICED_S && meter.trailing_silence_s >= PAUSE_S {
             if let Err(e) = flush(&mut buf, &mut text, &mut last_norm) {
                 eprintln!("[streaming] chunk: {e}");
             }
+            // `flush` empties the buffer whatever it decides to do with the text.
+            meter.reset();
         }
     }
 
     // Remainder: the final audio returned by recorder.stop() on the caller side.
     if let Ok(tail) = tail_rx.recv_timeout(Duration::from_secs(5)) {
+        meter.push(&tail);
         buf.extend(tail);
     }
-    let silence = trailing_silence(&buf);
-    if buf.len() as f32 / SAMPLE_RATE as f32 - silence >= 0.3 {
+    // Cancelled take: skip the remainder entirely (no transcription, no paste)
+    // and report nothing, so the caller does not log it in the history.
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(String::new());
+    }
+    if meter.voiced_s() >= MIN_TAIL_VOICED_S {
         flush(&mut buf, &mut text, &mut last_norm)?;
     }
     Ok(text)
@@ -241,6 +386,151 @@ fn collapse_repeats(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` seconds of audio at `amp` amplitude (0.0 = silence).
+    fn tone(secs: f32, amp: f32) -> Vec<f32> {
+        let n = (SAMPLE_RATE as f32 * secs) as usize;
+        (0..n).map(|i| if i % 2 == 0 { amp } else { -amp }).collect()
+    }
+
+    #[test]
+    fn meter_is_independent_of_how_audio_is_split() {
+        // The whole point of the incremental meter: feeding the same audio in
+        // one go or poll by poll must give the same measurement.
+        let audio = [tone(1.0, 0.5), tone(1.5, 0.0)].concat();
+
+        let mut whole = SpeechMeter::new();
+        whole.push(&audio);
+
+        let mut chunked = SpeechMeter::new();
+        for part in audio.chunks(SAMPLE_RATE / 5) {
+            chunked.push(part);
+        }
+
+        assert!((whole.voiced_s() - chunked.voiced_s()).abs() < 1e-4);
+        assert!((whole.trailing_silence_s - chunked.trailing_silence_s).abs() < 1e-4);
+        assert!((whole.voiced_s() - 1.0).abs() < 0.15, "voiced={}", whole.voiced_s());
+        assert!(
+            (whole.trailing_silence_s - 1.5).abs() < 0.15,
+            "silence={}",
+            whole.trailing_silence_s
+        );
+    }
+
+    #[test]
+    fn meter_reports_no_voiced_audio_on_pure_silence() {
+        // Anti-regression: simply capping the trailing-silence scan would make
+        // `voiced` = duration - capped_silence, so a long silent buffer would
+        // clear MIN_VOICED_S and be sent to transcription.
+        let mut m = SpeechMeter::new();
+        for _ in 0..300 {
+            m.push(&tone(1.0, 0.0)); // 5 minutes of silence
+        }
+        assert_eq!(m.voiced_s(), 0.0);
+        assert!(m.voiced_s() < MIN_VOICED_S);
+        assert!(m.trailing_silence_s >= PAUSE_S);
+    }
+
+    #[test]
+    fn meter_cost_stays_linear_on_a_long_silence() {
+        // Each 100 ms block must be analysed exactly once, however long the
+        // take runs. Rescanning the buffer every poll was quadratic (BUG-002).
+        let mut m = SpeechMeter::new();
+        let poll = tone(0.2, 0.0); // one 200 ms poll
+        for _ in 0..1500 {
+            m.push(&poll); // 5 minutes
+        }
+        assert_eq!(m.blocks_analysed, 3000, "un bloc doit etre analyse une seule fois");
+    }
+
+    #[test]
+    fn meter_silence_resets_after_speech_resumes() {
+        let mut m = SpeechMeter::new();
+        m.push(&tone(0.5, 0.5));
+        m.push(&tone(1.0, 0.0));
+        assert!(m.trailing_silence_s >= 0.9);
+        m.push(&tone(0.3, 0.5));
+        assert_eq!(m.trailing_silence_s, 0.0, "la parole doit remettre le silence a zero");
+    }
+
+    /// Realistic speech: words above the threshold separated by the
+    /// sub-threshold gaps every speaker leaves between them. 200 ms of word for
+    /// 300 ms of gap — deliberately gap-heavy, which is where the regression lived.
+    fn speech(words: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for _ in 0..words {
+            out.extend(tone(0.2, 0.05)); // a word
+            out.extend(tone(0.3, 0.001)); // the gap after it
+        }
+        out
+    }
+
+    /// Total duration of the blocks that are individually above the threshold —
+    /// i.e. what the regressed implementation used as `voiced_s`.
+    fn loud_block_total(samples: &[f32]) -> f32 {
+        samples
+            .chunks_exact(BLOCK_SAMPLES)
+            .filter(|b| {
+                (b.iter().map(|s| s * s).sum::<f32>() / BLOCK_SAMPLES as f32).sqrt() >= SILENCE_RMS
+            })
+            .count() as f32
+            * BLOCK_S
+    }
+
+    #[test]
+    fn a_short_utterance_reaches_the_flush_threshold() {
+        // The regression: summing only the loud blocks made `voiced_s` grow far
+        // slower than MIN_VOICED_S was calibrated for, so a short sentence never
+        // armed a flush, nothing was ever transcribed, and the take came back
+        // empty. Two words span 0.7 s and must clear the 0.6 s gate.
+        let audio = speech(2);
+        let mut m = SpeechMeter::new();
+        m.push(&audio);
+
+        // This is what makes the test a regression test rather than a
+        // tautology: the discarded implementation is measured here too, and it
+        // provably fails the gate on the very same audio.
+        assert!(
+            loud_block_total(&audio) < MIN_VOICED_S,
+            "l'audio doit piéger l'ancienne mesure, sinon ce test ne prouve rien"
+        );
+        assert!(
+            m.voiced_s() >= MIN_VOICED_S,
+            "deux mots doivent armer le flush, voiced={}",
+            m.voiced_s()
+        );
+    }
+
+    #[test]
+    fn a_pause_after_speech_still_cuts_the_chunk() {
+        // The span must not keep growing through the trailing silence, or the
+        // pause would never be seen as a pause.
+        let mut m = SpeechMeter::new();
+        m.push(&speech(3));
+        let before = m.voiced_s();
+        m.push(&tone(PAUSE_S + 0.3, 0.0));
+        assert!(m.trailing_silence_s >= PAUSE_S, "la pause doit etre vue");
+        assert!(
+            (m.voiced_s() - before).abs() < 0.05,
+            "le silence final ne doit pas gonfler la parole: {before} -> {}",
+            m.voiced_s()
+        );
+    }
+
+    #[test]
+    fn leading_silence_is_not_counted_as_speech() {
+        // Better than the formula this replaces, which counted everything
+        // before the last voiced block - including silence before the first.
+        let mut m = SpeechMeter::new();
+        m.push(&tone(5.0, 0.0));
+        assert_eq!(m.voiced_s(), 0.0);
+        m.push(&tone(0.4, 0.05));
+        assert!(
+            (m.voiced_s() - 0.4).abs() < 0.15,
+            "seule la parole compte, voiced={}",
+            m.voiced_s()
+        );
+    }
 
     #[test]
     fn collapse_repeated_phrase() {
