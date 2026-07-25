@@ -36,11 +36,20 @@ strip = true       # drop symbols: lighter shipped binary
 # std::panic::catch_unwind to keep the UI from hanging if the worker panics;
 # aborting on panic would defeat that safety net.
 
+[build-dependencies]
+# Embeds assets/dictata.ico and the version metadata into the exe (build.rs).
+# Not gated behind cfg(windows): a platform-specific build-dependency is
+# resolved against the *host*, so gating it would break build.rs when
+# cross-compiling to Windows from another OS. build.rs checks the target
+# itself and does nothing when it is not Windows.
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
     "Win32_System_SystemInformation",
 ] }

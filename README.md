@@ -5,6 +5,8 @@ global hotkey, speak, press again: the text is transcribed locally by
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and pasted into the
 active application. No data ever leaves the machine.
 
+Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
+
 ## Features
 
 - **Hotkey dictation** (toggle or push-to-talk), automatic paste into the
@@ -35,7 +37,8 @@ active application. No data ever leaves the machine.
 
 ## Requirements
 
-- Windows 10/11.
+- Windows 10/11. Linux is **not supported** in this release — see
+  [LINUX.md](LINUX.md) for what works, what does not, and why.
 - [ffmpeg](https://ffmpeg.org/) in `PATH` (only for "Transcribe a file").
 - To build with GPU support: the [Vulkan SDK](https://vulkan.lunarg.com/) and
   the Visual Studio Build Tools (CMake + Ninja included).
@@ -72,6 +75,30 @@ For a CPU-only build (no Vulkan SDK required):
 cargo build --release --no-default-features
 ```
 
+## Packaging a release
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\release-windows.ps1 -Variant both
+```
+
+Runs the tests, builds, and writes `dist\dictata-<version>-windows-x86_64[-cpu].zip`
+with its SHA-256. The zip contains only `dictata.exe`, `README.md`, `LICENSE`
+and `CHANGELOG.md`: no `config.json` is shipped (the app writes its own
+defaults on first run, and a development `config.json` carries personal data).
+The binary is self-contained — no DLL to ship alongside it; the Vulkan build
+uses the loader provided by the graphics driver.
+
+The executable carries its icon and version metadata, embedded by `build.rs`
+via `winresource`. The icon itself is drawn by a script rather than checked in
+as an opaque blob — edit the numbers and regenerate all sizes at once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
+```
+
+`scripts/release-linux.sh` mirrors the packaging script, but has never been
+run — see [LINUX.md](LINUX.md).
+
 ## Usage
 
 1. Launch the executable: the application lives in the system tray.
@@ -79,7 +106,9 @@ cargo build --release --no-default-features
    environment variable at launch): pick a model in the Models page (built-in
    download), set the hotkey, language and audio source.
 3. Place the cursor where you want to write, press the hotkey (default
-   `Ctrl+Alt+Space`), speak, press again. `Esc` cancels the current take.
+   `Ctrl+Alt+Space`), speak, press again. **Hold `Esc`** for about half a
+   second to cancel the current take — Escape is read globally, so a plain tap
+   is left to the application you are typing into.
 
 The configuration is read from `config.json` next to the executable, or from
 the directory pointed to by the `DICTATA_HOME` environment variable. The
@@ -110,9 +139,9 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 cargo test
 ```
 
-26 unit tests (config, resampling, mixing, modes, settings logic, hardware
-rating, HuggingFace query parsing, audio-context sizing…). A CLI
-example is provided:
+64 unit tests (config, resampling, mixing, modes, settings logic, hardware
+rating, HuggingFace query parsing, audio-context sizing, history retention,
+cancel gesture, download safety…). A CLI example is provided:
 
 ```powershell
 cargo run --example transcribe -- <file.wav>   # DICTATA_GPU=1 for GPU
