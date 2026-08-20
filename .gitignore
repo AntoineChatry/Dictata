@@ -11,3 +11,5 @@ config.json
 history.jsonl
 .claude/
 .serena/
+# Playwright MCP session artifacts (throwaway logs/snapshots)
+.playwright-mcp/

@@ -76,7 +76,10 @@ fi
 # --------------------------------------------------------------------- build
 step "Building release ($variant)"
 if [ "$variant" = "cpu" ]; then
-    cargo build --release --no-default-features
+    # `whisper` is the app's transcription backend; without it the engine has no
+    # backend and cannot transcribe. It is not in `default` (that pulls
+    # `vulkan`), so the CPU build must enable it explicitly.
+    cargo build --release --no-default-features --features whisper
 else
     cargo build --release
 fi

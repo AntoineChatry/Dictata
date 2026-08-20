@@ -4,6 +4,8 @@
 pub mod audio;
 pub mod config;
 pub mod dock;
+// Multi-backend ASR engine (whisper.cpp, Parakeet, …), incorporated as a module.
+pub mod engine;
 pub mod hardware;
 pub mod history;
 pub mod hotkey;

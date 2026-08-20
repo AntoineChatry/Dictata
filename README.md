@@ -1,9 +1,12 @@
 # Dictata
 
 **100% local** system-wide voice dictation for Windows, in native Rust. Press a
-global hotkey, speak, press again: the text is transcribed locally by
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) and pasted into the
-active application. No data ever leaves the machine.
+global hotkey, speak, press again: the text is transcribed locally and pasted
+into the active application. No data ever leaves the machine. Transcription runs
+on the multi-backend
+[Dictata Engine](https://github.com/AntoineChatry/DictataEngine) —
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) by default, with optional
+ONNX backends (Parakeet, SenseVoice, Moonshine, Zipformer).
 
 Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
 
@@ -20,6 +23,11 @@ Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
   Configuration.
 - **Vulkan GPU transcription** (AMD/Intel/NVIDIA) or CPU — whisper-rs with the
   `vulkan` feature.
+- **Multi-backend engine**: whisper.cpp by default; optional ONNX backends
+  (NVIDIA Parakeet, SenseVoice, Moonshine, Zipformer), each enabled at build
+  time via a Cargo feature. The backend is picked automatically from the shape
+  of the selected model (a ggml `.bin` file → whisper, an ONNX bundle
+  directory → its matching backend).
 - **Audio sources**: microphone, system audio (WASAPI loopback) or a mix of
   both (meeting mode).
 - **Output modes**: raw, or post-processing through a local OpenAI-compatible
@@ -30,8 +38,11 @@ Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
 - Built-in **ggml model library**: download, delete, and hardware-aware
   recommendations (detected GPU/VRAM when running on Vulkan, CPU/RAM
   otherwise).
-- **HuggingFace search**: install any ggml `.bin` model from a direct URL, a
-  repo (`owner/name`) or a keyword search.
+- **Recommended ONNX models**: one-click verified bundles (Parakeet,
+  SenseVoice, Zipformer, Moonshine) in the Models page, next to the ggml
+  catalog.
+- **HuggingFace search**: install any ggml `.bin` model or ONNX bundle from a
+  direct URL, a repo (`owner/name`) or a keyword search.
 - **fr / en / es interface**, dark theme, system tray icon, transcription
   history.
 
@@ -72,8 +83,34 @@ VsDevCmd.bat -arch=amd64 && set CMAKE_GENERATOR=Ninja && set CMAKE_GENERATOR_INS
 For a CPU-only build (no Vulkan SDK required):
 
 ```powershell
-cargo build --release --no-default-features
+cargo build --release --no-default-features --features whisper
 ```
+
+`whisper` is the transcription backend: `--no-default-features` drops `vulkan`
+(which is what pulls it in), so it must be re-enabled explicitly or the binary
+has no backend and cannot transcribe.
+
+### Transcription backends (optional)
+
+The ONNX backends are **off by default** — a stock build ships whisper.cpp only.
+Enable one (or several) at build time; each links onnxruntime statically through
+`ort`, so no extra DLL ships alongside the executable:
+
+```powershell
+cargo build --release --features parakeet      # NVIDIA Parakeet (add parakeet-directml for GPU)
+cargo build --release --features sensevoice    # SenseVoice CTC
+cargo build --release --features moonshine     # Moonshine
+cargo build --release --features zipformer     # Zipformer transducer
+```
+
+All backends at once (GPU whisper + every ONNX backend):
+
+```powershell
+cargo build --release --features "vulkan,parakeet-directml,sensevoice,moonshine,zipformer,vad"
+```
+
+Combine with `vulkan` (the default) to keep GPU whisper alongside an ONNX
+backend, e.g. `--features "vulkan,parakeet-directml"`.
 
 ## Packaging a release
 
@@ -123,13 +160,14 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 |---|---|
 | `main.rs` | Orchestration: states, hotkey, dock, transcription threads |
 | `audio.rs` | cpal capture (mic / loopback / mix), 16 kHz resampling, ffmpeg decoding |
-| `transcriber.rs` | whisper-rs wrapper (model loading, transcription) |
+| `transcriber.rs` | Facade over the ASR engine (backend chosen from the model's shape) |
+| `engine/` | Multi-backend ASR engine: `AsrEngine` trait, `EngineKind::detect`, backends (whisper, Parakeet, SenseVoice, Moonshine, Zipformer) |
 | `streaming.rs` | Continuous mode: pause-based chunking, progressive emission |
 | `settings.rs` | Settings window (8 pages, egui) — presentation |
 | `settings_logic.rs` | Settings business logic, testable without UI |
 | `dock.rs` | Floating dock (waveform, states) |
 | `modes.rs` / `llm.rs` | Output modes and local LLM post-processing |
-| `models.rs` | ggml catalog, download/delete, HuggingFace search, paths |
+| `models.rs` | ggml + ONNX catalogs, download/delete (files and bundles), HuggingFace search, paths |
 | `i18n.rs` | fr/en/es translations (`tr()`) |
 | `config.rs` / `history.rs` / `paste.rs` / `hotkey.rs` / `tray.rs` / `hardware.rs` / `platform.rs` | Config, history, paste, global hotkey, tray, hardware detection, Windows integration |
 
@@ -139,9 +177,10 @@ GPU: `gpu` config field — `"auto"` (default, uses Vulkan when available),
 cargo test
 ```
 
-64 unit tests (config, resampling, mixing, modes, settings logic, hardware
+83 unit tests (config, resampling, mixing, modes, settings logic, hardware
 rating, HuggingFace query parsing, audio-context sizing, history retention,
-cancel gesture, download safety…). A CLI example is provided:
+cancel gesture, download safety, backend detection, ONNX bundle handling…). A
+CLI example is provided:
 
 ```powershell
 cargo run --example transcribe -- <file.wav>   # DICTATA_GPU=1 for GPU

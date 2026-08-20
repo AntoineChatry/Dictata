@@ -120,7 +120,9 @@ pub struct SettingsState {
     /// one `exists()` per catalog entry each time. Keyed by the directory and
     /// refreshed on a short interval; set to `None` to force a refresh after an
     /// action that changes the folder.
-    models_cache: Option<(String, std::time::Instant, Vec<String>)>,
+    /// (dir, read-at, ggml `.bin` names, ONNX bundle directory names). Both
+    /// listings come from one directory read so a 60 fps repaint stays cheap.
+    models_cache: Option<(String, std::time::Instant, Vec<String>, Vec<String>)>,
     download: Option<Download>,
     llm_status: Option<bool>,
     history: Vec<history::Entry>,
@@ -133,6 +135,9 @@ pub struct SettingsState {
     hf_query: String,
     hf_repos: Vec<String>,
     hf_files: Vec<models::HfFile>,
+    /// ONNX bundle artifacts of the browsed repo (downloaded together as one
+    /// bundle directory).
+    hf_bundle: Vec<models::HfFile>,
     hf_error: Option<String>,
     hf_task: Option<Arc<Mutex<Option<HfOutcome>>>>,
 }
@@ -145,7 +150,8 @@ const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(5
 /// Result of a HuggingFace fetch (search or repo file listing).
 enum HfOutcome {
     Repos(Result<Vec<String>, String>),
-    Files(Result<Vec<models::HfFile>, String>),
+    /// Repo listing split into (ggml `.bin` models, ONNX bundle artifacts).
+    Files(Result<(Vec<models::HfFile>, Vec<models::HfFile>), String>),
 }
 
 /// "Transcribe a file" worker: the result arrives via `done`.
@@ -200,6 +206,7 @@ impl SettingsState {
             hf_query: String::new(),
             hf_repos: Vec::new(),
             hf_files: Vec::new(),
+            hf_bundle: Vec::new(),
             hf_error: None,
             hf_task: None,
         }
@@ -211,9 +218,12 @@ impl SettingsState {
     }
 
     /// Cached `.bin` listing of `dir`, re-read at most every `MODELS_CACHE_TTL`.
-    fn installed_files(&mut self, dir: &str) -> &[String] {
+    /// Refreshes the cached directory listing (both `.bin` files and ONNX
+    /// bundle directories) when it is stale. Shared by [`Self::installed_files`]
+    /// and [`Self::installed_bundle_dirs`], so one directory read feeds both.
+    fn refresh_models_cache(&mut self, dir: &str) {
         let stale = match &self.models_cache {
-            Some((cached_dir, at, _)) => cached_dir != dir || at.elapsed() >= MODELS_CACHE_TTL,
+            Some((cached_dir, at, _, _)) => cached_dir != dir || at.elapsed() >= MODELS_CACHE_TTL,
             None => true,
         };
         if stale {
@@ -221,9 +231,21 @@ impl SettingsState {
                 dir.to_string(),
                 std::time::Instant::now(),
                 models::installed_files(dir),
+                models::installed_bundles(dir),
             ));
         }
+    }
+
+    fn installed_files(&mut self, dir: &str) -> &[String] {
+        self.refresh_models_cache(dir);
         &self.models_cache.as_ref().expect("just populated above").2
+    }
+
+    /// Installed ONNX bundle **directory** names (multi-file backends), cached
+    /// alongside the `.bin` listing.
+    fn installed_bundle_dirs(&mut self, dir: &str) -> &[String] {
+        self.refresh_models_cache(dir);
+        &self.models_cache.as_ref().expect("just populated above").3
     }
 }
 
@@ -1049,8 +1071,15 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
         let name = dl.model.clone();
         card(ui, None, |ui| {
             ui.label(format!("{} {name}", tr("models_downloading")));
-            let frac = if total > 0 { recv as f32 / total as f32 } else { 0.0 };
-            ui.add(egui::ProgressBar::new(frac).show_percentage());
+            // With a known total, a percentage bar; otherwise (sizes missing) an
+            // animated bar labelled with the bytes received so far, so a large
+            // multi-GB bundle download never looks frozen at 0 %.
+            if total > 0 {
+                ui.add(egui::ProgressBar::new(recv as f32 / total as f32).show_percentage());
+            } else {
+                let mb = recv as f64 / 1_000_000.0;
+                ui.add(egui::ProgressBar::new(0.0).animate(true).text(format!("{mb:.0} Mo")));
+            }
             if done {
                 if let Some(e) = &err {
                     ui.colored_label(BAD, e);
@@ -1116,13 +1145,23 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
     let dir = st.cfg.model_dir.clone();
     let model_files: Vec<String> = st.installed_files(&dir).to_vec();
     let installed = models::list_installed_from(&model_files);
+    // ONNX bundle directories (Parakeet, sherpa exports) live beside the `.bin`
+    // models and are listed the same way, with the backend name as subtitle.
+    let bundles: Vec<String> = st.installed_bundle_dirs(&dir).to_vec();
     card(ui, Some(tr("models_installed")), |ui| {
-        if installed.is_empty() {
+        if installed.is_empty() && bundles.is_empty() {
             ui.label(RichText::new(tr("models_none")).color(DIM));
         }
         for name in &installed {
             let active = st.cfg.model == *name;
             model_row(ui, st, name, &format!("{name}"), "", active, true, None);
+        }
+        for name in &bundles {
+            let active = st.cfg.model == *name;
+            let backend = crate::engine::EngineKind::detect(&std::path::Path::new(&dir).join(name))
+                .map(|k| format!("{k:?}"))
+                .unwrap_or_default();
+            model_row(ui, st, name, name, &backend, active, true, None);
         }
     });
 
@@ -1142,7 +1181,59 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
             };
             let _ = &reco;
             let sub = format!("{} Mo \u{00b7} {}", c.size_mb, rating.detail);
-            model_row(ui, st, c.name, c.label, &sub, active, inst, badge);
+            // The "(quantized)" qualifier follows the app language; the base
+            // name (Tiny, Base, …) stays as-is.
+            let title = if c.quantized {
+                format!("{} ({})", c.label, tr("models_quantized"))
+            } else {
+                c.label.to_string()
+            };
+            model_row(ui, st, c.name, &title, &sub, active, inst, badge);
+        }
+    });
+
+    // Curated ONNX bundles: one verified repo per multi-file backend, fetched
+    // with a single click. This is the safe shortcut past HuggingFace search,
+    // where an incompatible repo (a NeMo `.nemo`, a FunASR export) downloads
+    // "successfully" yet never classifies. Delete/use live in the installed
+    // card above, so here an installed entry only shows its state.
+    card(ui, Some(tr("onnx_card")), |ui| {
+        ui.label(RichText::new(tr("onnx_hint")).color(DIM).size(12.0));
+        ui.add_space(2.0);
+        for c in models::ONNX_CATALOG {
+            let leaf = models::dir_name(c.repo);
+            let installed = bundles.contains(&leaf);
+            let active = st.cfg.model == leaf;
+            let sub = format!("{} \u{00b7} {} Mo", c.backend, c.size_mb);
+            egui::Frame::NONE
+                .fill(ROW_BG)
+                .stroke(Stroke::new(1.0, CARD_BORDER))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(RichText::new(tr(c.label_key)).strong());
+                            ui.label(RichText::new(&sub).size(11.0).color(DIM));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if active {
+                                ui.label(RichText::new(tr("models_active")).color(ACCENT).strong());
+                            } else if installed {
+                                ui.label(RichText::new(tr("onnx_installed")).color(OK));
+                            } else if st.download.is_none() {
+                                if ui.button(tr("models_download")).clicked() {
+                                    st.download =
+                                        Some(spawn_catalog_bundle(&dir, c.repo, ui.ctx().clone()));
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new(tr("models_download")));
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
         }
     });
 
@@ -1157,9 +1248,10 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
                     st.hf_files.clear();
                     st.hf_repos = r;
                 }
-                HfOutcome::Files(Ok(f)) => {
+                HfOutcome::Files(Ok((bins, bundle))) => {
                     st.hf_repos.clear();
-                    st.hf_files = f;
+                    st.hf_files = bins;
+                    st.hf_bundle = bundle;
                 }
                 HfOutcome::Repos(Err(e)) | HfOutcome::Files(Err(e)) => st.hf_error = Some(e),
             }
@@ -1241,6 +1333,39 @@ fn page_models(ui: &mut egui::Ui, st: &mut SettingsState, ctx: &egui::Context) {
                     });
                 });
             }
+        }
+        // Repo files forming an ONNX bundle: fetched together into one directory
+        // (`model_dir/{repo-leaf}/`), which `detect()` then classifies. Only
+        // offered when the repo actually ships a graph: a card page with just
+        // JSON/tokenizer sidecars (a NeMo `.nemo` repo) is not a usable bundle.
+        let has_onnx = st
+            .hf_bundle
+            .iter()
+            .any(|f| f.fname.to_ascii_lowercase().ends_with(".onnx"));
+        if !st.hf_bundle.is_empty() && has_onnx {
+            ui.add_space(6.0);
+            let files = st.hf_bundle.clone();
+            let repo = files[0].repo.clone();
+            let leaf = models::dir_name(&repo);
+            let total_mb: u64 = files.iter().filter_map(|f| f.size).sum::<u64>() / 1_000_000;
+            ui.label(RichText::new(tr("hf_bundle")).strong());
+            ui.label(
+                RichText::new(format!("{leaf} \u{00b7} {} \u{00d7} onnx/txt \u{00b7} {total_mb} Mo", files.len()))
+                    .color(DIM)
+                    .size(11.0),
+            );
+            ui.horizontal(|ui| {
+                if bundles.contains(&leaf) {
+                    ui.label(RichText::new(tr("models_done")).color(OK));
+                } else if st.download.is_none() {
+                    if ui.button(tr("hf_dl_bundle")).clicked() {
+                        st.download =
+                            Some(spawn_download_bundle(&dir, &leaf, files.clone(), ui.ctx().clone()));
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new(tr("hf_dl_bundle")));
+                }
+            });
         }
     });
 }
@@ -1495,6 +1620,88 @@ fn spawn_download_url(dir: &str, url: &str, fname: &str, label: &str, ctx: egui:
     }
 }
 
+/// Downloads an ONNX bundle (every file in `files`) into `dir/{subdir}/` on a
+/// worker thread, reporting aggregate progress through the same [`Download`]
+/// handle the single-file path uses.
+fn spawn_download_bundle(
+    dir: &str,
+    subdir: &str,
+    files: Vec<models::HfFile>,
+    ctx: egui::Context,
+) -> Download {
+    let received = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(Mutex::new(None));
+    let (d, s) = (dir.to_string(), subdir.to_string());
+    let (r2, t2, f2, e2) = (received.clone(), total.clone(), finished.clone(), error.clone());
+    std::thread::spawn(move || {
+        let r3 = r2.clone();
+        let res = models::download_bundle(&d, &s, &files, |recu, tot| {
+            r3.store(recu, Ordering::Relaxed);
+            if let Some(t) = tot {
+                t2.store(t, Ordering::Relaxed);
+            }
+            ctx.request_repaint();
+        });
+        if let Err(e) = res {
+            *e2.lock().unwrap() = Some(e);
+        }
+        f2.store(true, Ordering::Relaxed);
+        ctx.request_repaint();
+    });
+    Download {
+        model: subdir.to_string(),
+        received,
+        total,
+        finished,
+        error,
+    }
+}
+
+/// One-click download of a curated [`models::ONNX_CATALOG`] entry: lists the
+/// repo, keeps only its bundle files, and fetches them into `dir/{repo-leaf}/`,
+/// all on one worker thread. Unlike the search path (browse -> pick -> download)
+/// the user never sees the repo listing; a listing failure or a repo that ships
+/// no `.onnx` graph surfaces through the same [`Download`] error channel.
+fn spawn_catalog_bundle(dir: &str, repo: &str, ctx: egui::Context) -> Download {
+    let received = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(Mutex::new(None));
+    let (d, r) = (dir.to_string(), repo.to_string());
+    let leaf = models::dir_name(repo);
+    let (r2, t2, f2, e2) = (received.clone(), total.clone(), finished.clone(), error.clone());
+    std::thread::spawn(move || {
+        let r3 = r2.clone();
+        let res = models::hf_list_repo(&r).and_then(|(_, bundle)| {
+            if bundle.iter().all(|f| !f.fname.to_ascii_lowercase().ends_with(".onnx")) {
+                return Err(format!("{r}: no ONNX bundle found in this repo"));
+            }
+            models::download_bundle(&d, &r, &bundle, |recu, tot| {
+                r3.store(recu, Ordering::Relaxed);
+                if let Some(t) = tot {
+                    t2.store(t, Ordering::Relaxed);
+                }
+                ctx.request_repaint();
+            })
+            .map(|_| ())
+        });
+        if let Err(e) = res {
+            *e2.lock().unwrap() = Some(e);
+        }
+        f2.store(true, Ordering::Relaxed);
+        ctx.request_repaint();
+    });
+    Download {
+        model: leaf,
+        received,
+        total,
+        finished,
+        error,
+    }
+}
+
 /// Runs a HuggingFace fetch (search or file listing) on a worker thread.
 fn spawn_hf(query: models::HfQuery, ctx: egui::Context) -> Arc<Mutex<Option<HfOutcome>>> {
     let slot: Arc<Mutex<Option<HfOutcome>>> = Arc::new(Mutex::new(None));
@@ -1502,7 +1709,7 @@ fn spawn_hf(query: models::HfQuery, ctx: egui::Context) -> Arc<Mutex<Option<HfOu
     std::thread::spawn(move || {
         let outcome = match query {
             models::HfQuery::Search(q) => HfOutcome::Repos(models::hf_search(&q)),
-            models::HfQuery::Repo(r) => HfOutcome::Files(models::hf_list_files(&r)),
+            models::HfQuery::Repo(r) => HfOutcome::Files(models::hf_list_repo(&r)),
             models::HfQuery::FileUrl(..) => unreachable!("handled by the caller"),
         };
         *slot2.lock().unwrap() = Some(outcome);

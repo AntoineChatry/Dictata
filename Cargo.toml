@@ -21,11 +21,38 @@ serde_json = "1.0.150"
 tray-icon = "0.21"
 whisper-rs = "0.16.0"
 
+# --- ASR engine module (src/engine) ---
+# Unified engine error type: pure Rust, light.
+thiserror = "2"
+# Optional engine backends, each isolating its heavy native deps behind a
+# feature. All off by default: the default (whisper/vulkan) build pulls none.
+parakeet-rs = { version = "0.3", optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-native",
+], optional = true }
+realfft = { version = "3.5", optional = true }
+kaldi-native-fbank = { version = "0.1", optional = true }
+
 [features]
 # GPU transcription. Enabled by default; build with --no-default-features
 # for a CPU-only binary that does not require the Vulkan SDK.
 default = ["vulkan"]
-vulkan = ["whisper-rs/vulkan"]
+vulkan = ["whisper", "whisper-rs/vulkan"]
+# Engine backends. `whisper-rs` is a hard dependency of the app itself
+# (transcriber.rs), so `whisper` only gates the engine's whisper backend module,
+# not the crate — hence `[]`, not `dep:whisper-rs`.
+whisper = []
+parakeet = ["dep:parakeet-rs"]
+parakeet-directml = ["parakeet", "parakeet-rs/directml"]
+resample = []
+vad = ["dep:ort"]
+diarize = ["parakeet", "parakeet-rs/sortformer"]
+sensevoice = ["dep:ort", "dep:realfft"]
+moonshine = ["dep:ort"]
+zipformer = ["dep:ort", "dep:kaldi-native-fbank"]
 
 [profile.release]
 opt-level = 3

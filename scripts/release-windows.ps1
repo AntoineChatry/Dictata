@@ -80,7 +80,10 @@ if ($Variant -eq 'both') { $variants = @('gpu', 'cpu') } else { $variants = @($V
 foreach ($v in $variants) {
     Step "Building release ($v)"
     if ($v -eq 'cpu') {
-        & cargo build --release --no-default-features
+        # `whisper` is the app's transcription backend; without it the engine has
+        # no backend and cannot transcribe. It is not in `default` (that pulls
+        # `vulkan`), so the CPU build must enable it explicitly.
+        & cargo build --release --no-default-features --features whisper
     } else {
         & cargo build --release
     }
