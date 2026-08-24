@@ -136,7 +136,10 @@ pub fn transcribe_file(cfg: &Config, path: &Path) -> Result<String, String> {
     let lang = mode.language.clone().or_else(|| cfg.language.clone());
     let prompt = modes::build_initial_prompt(&cfg.vocabulary, "");
     let prompt_opt = if prompt.is_empty() { None } else { Some(prompt.as_str()) };
-    let raw = t.transcribe(&audio_data, lang.as_deref(), mode.task == "translate", prompt_opt, cfg.beam_size, None)?;
+    // Same VAD as the dictation path: whisper uses its internal ggml VAD, the
+    // ONNX backends the shared external Silero VAD, fetched on first use.
+    let vad_path = models::resolve_vad_path(&cfg.model_dir, &model_path, cfg.vad);
+    let raw = t.transcribe(&audio_data, lang.as_deref(), mode.task == "translate", prompt_opt, cfg.beam_size, vad_path.as_deref())?;
     let lang_detected = t.detected_language();
     let (text, _status) = modes::apply_mode(&raw, &mode, cfg, lang_detected);
     if text.trim().is_empty() {

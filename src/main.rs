@@ -561,15 +561,7 @@ impl App {
             // VAD (one-shot only): if the user enabled it, fetch the small
             // model on first use, then hand its path to the transcription.
             // Computed before locking so a download never blocks streaming.
-            let vad_path = if cfg.vad {
-                let p = dictata::models::vad_model_path(&cfg.model_dir);
-                if !p.exists() {
-                    let _ = dictata::models::download_vad(&cfg.model_dir, |_, _| {});
-                }
-                p.exists().then_some(p)
-            } else {
-                None
-            };
+            let vad_path = dictata::models::resolve_vad_path(&cfg.model_dir, &model_path, cfg.vad);
             let mut guard = tr.lock().unwrap_or_else(|p| p.into_inner());
             if guard.is_none() {
                 match Transcriber::load(&model_path, gpu) {

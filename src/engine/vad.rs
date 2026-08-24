@@ -11,7 +11,8 @@
 //! Bring a **Silero VAD v5** ONNX model (`silero_vad.onnx`, ~2 MB, from
 //! [snakers4/silero-vad](https://github.com/snakers4/silero-vad)). It is not
 //! bundled — download it separately, like the ASR models. The v5 graph takes a
-//! 512-sample window plus a recurrent `state`, and a sample-rate input.
+//! 576-sample input (64 samples of lookback context + a 512-sample hop) plus a
+//! recurrent `state`, and a sample-rate input.
 //!
 //! # What it is not
 //!
@@ -25,9 +26,16 @@ use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Value;
 
-/// Samples per inference window. Silero v5 is trained for a fixed 512-sample
-/// window at 16 kHz; other sizes are not accepted by the graph.
+/// New samples consumed per inference step (the hop). Silero v5 advances 512
+/// samples at 16 kHz per window.
 const WINDOW_SAMPLES: usize = 512;
+
+/// Lookback context prepended to every window. Silero v5 feeds the model
+/// `CONTEXT_SAMPLES + WINDOW_SAMPLES` samples (64 + 512 = 576): the 64 tail
+/// samples of the previous window, then the 512 new ones. **Without this
+/// context the model silently returns ~0 even on clear speech** — the current
+/// v5 export (producer `spox`) requires it, unlike older 512-only exports.
+const CONTEXT_SAMPLES: usize = 64;
 
 /// Length of the recurrent state tensor: shape `[2, 1, 128]` = 256 floats.
 const STATE_LEN: usize = 2 * 128;
@@ -99,6 +107,8 @@ pub struct SileroVad {
     sr_input: String,
     // Recurrent state, carried window to window; shape [2, 1, 128].
     state: Vec<f32>,
+    // Lookback samples prepended to the next window; `CONTEXT_SAMPLES` long.
+    context: Vec<f32>,
 }
 
 impl SileroVad {
@@ -146,6 +156,7 @@ impl SileroVad {
             state_input,
             sr_input,
             state: vec![0.0; STATE_LEN],
+            context: vec![0.0; CONTEXT_SAMPLES],
         })
     }
 
@@ -178,6 +189,7 @@ impl SileroVad {
     /// depends only on `audio`.
     fn window_probabilities(&mut self, audio: &[f32]) -> Result<Vec<f32>, AsrError> {
         self.state.iter_mut().for_each(|s| *s = 0.0);
+        self.context.iter_mut().for_each(|s| *s = 0.0);
         let window_count = audio.len().div_ceil(WINDOW_SAMPLES);
         let mut probs = Vec::with_capacity(window_count);
         let mut window = [0.0f32; WINDOW_SAMPLES];
@@ -205,11 +217,19 @@ impl SileroVad {
             state_input,
             sr_input,
             state,
+            context,
             ..
         } = self;
 
-        let audio_val = Value::from_array(([1_i64, WINDOW_SAMPLES as i64], window.to_vec()))
-            .map_err(|e| AsrError::Transcribe(format!("vad audio tensor: {e}")))?;
+        // Prepend the lookback context: the model wants CONTEXT_SAMPLES + 512
+        // samples (see `CONTEXT_SAMPLES`). Feeding a bare 512-sample window makes
+        // it return ~0 on speech.
+        let mut input = Vec::with_capacity(CONTEXT_SAMPLES + WINDOW_SAMPLES);
+        input.extend_from_slice(context);
+        input.extend_from_slice(window);
+        let audio_val =
+            Value::from_array(([1_i64, (CONTEXT_SAMPLES + WINDOW_SAMPLES) as i64], input))
+                .map_err(|e| AsrError::Transcribe(format!("vad audio tensor: {e}")))?;
         let state_val = Value::from_array(([2_i64, 1, 128], state.clone()))
             .map_err(|e| AsrError::Transcribe(format!("vad state tensor: {e}")))?;
         let sr_val = Value::from_array(([1_i64], vec![SAMPLE_RATE as i64]))
@@ -239,6 +259,9 @@ impl SileroVad {
         if new_state.len() == STATE_LEN {
             state.copy_from_slice(new_state);
         }
+
+        // Next window's lookback = the last CONTEXT_SAMPLES of this window.
+        context.copy_from_slice(&window[WINDOW_SAMPLES - CONTEXT_SAMPLES..]);
 
         Ok(prob)
     }

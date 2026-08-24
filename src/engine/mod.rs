@@ -35,6 +35,8 @@
 pub mod diarize;
 pub mod engines;
 pub mod error;
+#[cfg(feature = "vad")]
+pub mod pipeline;
 #[cfg(feature = "resample")]
 pub mod resample;
 pub mod types;

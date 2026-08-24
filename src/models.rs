@@ -317,6 +317,70 @@ pub fn download_vad(
     download_url(model_dir, VAD_MODEL_URL, VAD_MODEL_FILE, progress)
 }
 
+// ---------- External VAD model (shared Silero ONNX) ----------
+
+/// File name of the shared external Silero VAD (v5 ONNX), stored next to the
+/// models. The non-whisper backends (Parakeet, SenseVoice, Moonshine,
+/// Zipformer) have no internal VAD, so they gate silence through this shared
+/// model; whisper.cpp keeps its own internal VAD ([`VAD_MODEL_FILE`]).
+pub const SILERO_ONNX_FILE: &str = "silero_vad.onnx";
+// The canonical Silero v5 export (producer `spox`), the one the engine's VAD
+// expects (576-sample input = 64 lookback + 512 hop). From the upstream repo.
+const SILERO_ONNX_URL: &str =
+    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
+
+pub fn silero_onnx_path(model_dir: &str) -> PathBuf {
+    Path::new(model_dir).join(SILERO_ONNX_FILE)
+}
+
+/// Download the external Silero ONNX VAD (~2 MB) into `model_dir`
+/// (`.part`-then-rename scheme).
+pub fn download_silero_onnx(
+    model_dir: &str,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, String> {
+    download_url(model_dir, SILERO_ONNX_URL, SILERO_ONNX_FILE, progress)
+}
+
+/// Resolve the VAD model to hand to a transcription, fetching it on first use.
+/// `None` when `vad_enabled` is off or the model could not be obtained.
+///
+/// The right VAD file depends on the backend, picked from `model_path`'s shape
+/// via [`crate::engine::EngineKind`]: whisper.cpp uses its own internal ggml VAD
+/// ([`VAD_MODEL_FILE`]); the ONNX backends have none and share the external
+/// Silero ONNX VAD ([`SILERO_ONNX_FILE`]), which is only useful when the `vad`
+/// feature is built — without it the facade ignores the model, so it is not
+/// fetched. Shared by the dictation worker and the "transcribe a file" path.
+pub fn resolve_vad_path(model_dir: &str, model_path: &Path, vad_enabled: bool) -> Option<PathBuf> {
+    if !vad_enabled {
+        return None;
+    }
+    let is_whisper = matches!(
+        crate::engine::EngineKind::detect(model_path),
+        Ok(crate::engine::EngineKind::Whisper)
+    );
+    if is_whisper {
+        let p = vad_model_path(model_dir);
+        if !p.exists() {
+            let _ = download_vad(model_dir, |_, _| {});
+        }
+        p.exists().then_some(p)
+    } else {
+        #[cfg(feature = "vad")]
+        {
+            let p = silero_onnx_path(model_dir);
+            if !p.exists() {
+                let _ = download_silero_onnx(model_dir, |_, _| {});
+            }
+            p.exists().then_some(p)
+        }
+        #[cfg(not(feature = "vad"))]
+        {
+            None
+        }
+    }
+}
+
 /// Last path component of `fname`, rejecting anything that cannot name a file
 /// inside a directory (traversal, empty, separator only).
 ///
